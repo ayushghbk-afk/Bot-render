@@ -5,19 +5,19 @@ const {
     downloadContentFromMessage
 } = require("@whiskeysockets/baileys");
 
-const qrcode = require("qrcode-terminal");
 const { Boom } = require("@hapi/boom");
 const pino = require("pino");
 const tesseract = require("node-tesseract-ocr");
+const QRCode = require("qrcode");
+const cheerio = require("cheerio");
 const fs = require("fs");
 const path = require("path");
-const cheerio = require("cheerio");
 const http = require("http");
 
 const logger = pino({ level: "silent" });
 
 /* ============================================================
-   CONFIG
+   CONFIGURATION
 ============================================================ */
 
 const CONFIG = {
@@ -52,25 +52,14 @@ const CONFIG = {
     TEMPERATURE:
         Number(process.env.TEMPERATURE || 0.7),
 
-    /*
-     * Comma-separated JIDs.
-     *
-     * Example:
-     * 919876543210@s.whatsapp.net
-     * 120363xxxxxxxxxx@g.us
-     */
+    WHITELIST_ONLY:
+        process.env.WHITELIST_ONLY !== "false",
+
     ALLOWED_USERS:
         (process.env.ALLOWED_USERS || "")
             .split(",")
             .map(x => x.trim())
             .filter(Boolean),
-
-    /*
-     * true = only ALLOWED_USERS
-     * false = respond to all incoming chats
-     */
-    WHITELIST_ONLY:
-        process.env.WHITELIST_ONLY !== "false",
 
     SESSION_DIR:
         process.env.SESSION_DIR || "./auth_session",
@@ -107,59 +96,306 @@ const tesseractConfig = {
 };
 
 /* ============================================================
-   HEALTH SERVER
+   QR STATE
 ============================================================ */
 
-const server = http.createServer((req, res) => {
-    if (req.url === "/health") {
-        res.writeHead(200, {
-            "Content-Type": "application/json"
-        });
+let latestQR = null;
+let botConnected = false;
 
-        res.end(
-            JSON.stringify({
-                ok: true,
-                service: "whatsapp-ai-bot",
-                uptime: process.uptime(),
-                timestamp: new Date().toISOString()
-            })
+/* ============================================================
+   HEALTH + QR WEB SERVER
+============================================================ */
+
+const server = http.createServer(
+    async (req, res) => {
+
+        /* ----------------------------------------------------
+           HEALTH
+        ---------------------------------------------------- */
+
+        if (req.url === "/health") {
+            res.writeHead(200, {
+                "Content-Type":
+                    "application/json"
+            });
+
+            return res.end(
+                JSON.stringify({
+                    ok: true,
+                    service:
+                        "whatsapp-ai-bot",
+                    connected:
+                        botConnected,
+                    uptime:
+                        process.uptime(),
+                    timestamp:
+                        new Date().toISOString()
+                })
+            );
+        }
+
+        /* ----------------------------------------------------
+           PAIR PAGE
+        ---------------------------------------------------- */
+
+        if (req.url === "/pair") {
+
+            res.writeHead(200, {
+                "Content-Type":
+                    "text/html; charset=utf-8"
+            });
+
+            if (botConnected) {
+                return res.end(`
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport"
+      content="width=device-width,initial-scale=1">
+<title>WhatsApp Bot</title>
+</head>
+
+<body style="
+font-family:Arial;
+text-align:center;
+padding:40px;
+background:#f5f5f5;
+">
+
+<h1>✅ WhatsApp Connected</h1>
+
+<p>Your bot is already connected to WhatsApp.</p>
+
+<p>You don't need to scan another QR.</p>
+
+</body>
+</html>
+                `);
+            }
+
+            if (!latestQR) {
+                return res.end(`
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport"
+      content="width=device-width,initial-scale=1">
+
+<meta http-equiv="refresh" content="5">
+
+<title>WhatsApp Pairing</title>
+</head>
+
+<body style="
+font-family:Arial;
+text-align:center;
+padding:30px;
+background:#f5f5f5;
+">
+
+<h2>📱 WhatsApp Bot</h2>
+
+<p>Waiting for WhatsApp QR...</p>
+
+<p>
+This page will refresh automatically.
+</p>
+
+</body>
+</html>
+                `);
+            }
+
+            try {
+
+                const qrData =
+                    await QRCode.toDataURL(
+                        latestQR,
+                        {
+                            width: 400,
+                            margin: 2
+                        }
+                    );
+
+                return res.end(`
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta name="viewport"
+      content="width=device-width,initial-scale=1">
+
+<meta http-equiv="refresh" content="30">
+
+<title>WhatsApp Bot Pairing</title>
+
+</head>
+
+<body style="
+font-family:Arial;
+text-align:center;
+background:#f5f5f5;
+padding:20px;
+">
+
+<h2>📱 WhatsApp Bot</h2>
+
+<p>
+Open WhatsApp → Linked devices
+→ Link a device
+</p>
+
+<div style="
+background:white;
+display:inline-block;
+padding:15px;
+border-radius:15px;
+box-shadow:0 2px 10px rgba(0,0,0,.15);
+">
+
+<img
+src="${qrData}"
+style="
+width:min(90vw,400px);
+height:auto;
+display:block;
+">
+
+</div>
+
+<p>
+Scan this QR code with WhatsApp.
+</p>
+
+<button
+onclick="location.reload()"
+style="
+padding:12px 22px;
+font-size:16px;
+border:0;
+border-radius:8px;
+cursor:pointer;
+">
+
+🔄 Refresh QR
+
+</button>
+
+<p style="
+font-size:13px;
+color:#666;
+margin-top:25px;
+">
+
+QR codes expire quickly.
+If it doesn't work, refresh the page.
+
+</p>
+
+</body>
+</html>
+                `);
+
+            } catch (error) {
+
+                console.error(
+                    "[QR WEB ERROR]",
+                    error
+                );
+
+                res.writeHead(500);
+
+                return res.end(
+                    "QR generation failed."
+                );
+            }
+        }
+
+        /* ----------------------------------------------------
+           ROOT
+        ---------------------------------------------------- */
+
+        if (req.url === "/") {
+
+            res.writeHead(200, {
+                "Content-Type":
+                    "text/html"
+            });
+
+            return res.end(`
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta name="viewport"
+content="width=device-width,initial-scale=1">
+
+<title>WhatsApp AI Bot</title>
+
+</head>
+
+<body style="
+font-family:Arial;
+text-align:center;
+padding:40px;
+">
+
+<h1>🤖 WhatsApp AI Bot</h1>
+
+<p>Online and running.</p>
+
+<p>
+<a href="/health">Health</a>
+</p>
+
+<p>
+<a href="/pair">WhatsApp Pairing</a>
+</p>
+
+</body>
+
+</html>
+            `);
+        }
+
+        /* ----------------------------------------------------
+           404
+        ---------------------------------------------------- */
+
+        res.writeHead(404);
+
+        res.end("Not found");
+    }
+);
+
+server.listen(
+    CONFIG.PORT,
+    "0.0.0.0",
+    () => {
+
+        console.log(
+            `🌐 Server running on port ${CONFIG.PORT}`
         );
 
-        return;
     }
-
-    if (req.url === "/") {
-        res.writeHead(200, {
-            "Content-Type": "text/plain"
-        });
-
-        res.end(
-            "WhatsApp AI Bot is online."
-        );
-
-        return;
-    }
-
-    res.writeHead(404);
-    res.end("Not found");
-});
-
-server.listen(CONFIG.PORT, "0.0.0.0", () => {
-    console.log(
-        `🌐 Health server listening on port ${CONFIG.PORT}`
-    );
-});
+);
 
 /* ============================================================
    ACCESS CONTROL
 ============================================================ */
 
 function isUserAllowed(jid) {
+
     if (!CONFIG.WHITELIST_ONLY) {
         return true;
     }
 
-    return CONFIG.ALLOWED_USERS.includes(jid);
+    return CONFIG.ALLOWED_USERS
+        .includes(jid);
 }
 
 /* ============================================================
@@ -167,9 +403,11 @@ function isUserAllowed(jid) {
 ============================================================ */
 
 async function searchTheWeb(query) {
+
     try {
+
         console.log(
-            `[Web Search] Searching: ${query}`
+            `[Web Search] ${query}`
         );
 
         const searchUrl =
@@ -177,20 +415,26 @@ async function searchTheWeb(query) {
                 query
             )}&format=json&no_html=1&skip_disambig=1`;
 
-        const response = await fetch(searchUrl, {
-            headers: {
-                "User-Agent":
-                    "Mozilla/5.0"
-            }
-        });
+        const response =
+            await fetch(
+                searchUrl,
+                {
+                    headers: {
+                        "User-Agent":
+                            "Mozilla/5.0"
+                    }
+                }
+            );
 
         let results = [];
 
         if (response.ok) {
+
             const data =
                 await response.json();
 
             if (data.AbstractText) {
+
                 results.push(
                     data.AbstractText
                 );
@@ -201,13 +445,17 @@ async function searchTheWeb(query) {
                     data.RelatedTopics
                 )
             ) {
+
                 for (
                     const topic of
                     data.RelatedTopics
                 ) {
+
                     if (
                         results.length >= 3
-                    ) break;
+                    ) {
+                        break;
+                    }
 
                     if (
                         topic.Text &&
@@ -215,29 +463,38 @@ async function searchTheWeb(query) {
                             topic.Text
                         )
                     ) {
+
                         results.push(
                             topic.Text
                         );
+
                     }
                 }
             }
         }
 
-        /*
-         * HTML fallback
-         */
-        if (results.length === 0) {
+        /* ----------------------------------------------------
+           HTML FALLBACK
+        ---------------------------------------------------- */
+
+        if (
+            results.length === 0
+        ) {
+
             const htmlResponse =
                 await fetch(
                     "https://html.duckduckgo.com/html/",
                     {
                         method: "POST",
+
                         headers: {
                             "Content-Type":
                                 "application/x-www-form-urlencoded",
+
                             "User-Agent":
                                 "Mozilla/5.0"
                         },
+
                         body:
                             `q=${encodeURIComponent(
                                 query
@@ -245,27 +502,36 @@ async function searchTheWeb(query) {
                     }
                 );
 
-            if (htmlResponse.ok) {
+            if (
+                htmlResponse.ok
+            ) {
+
                 const html =
                     await htmlResponse.text();
 
                 const $ =
-                    cheerio.load(html);
+                    cheerio.load(
+                        html
+                    );
 
                 $(".result__snippet")
                     .slice(0, 3)
-                    .each((i, el) => {
-                        const text =
-                            $(el)
-                                .text()
-                                .trim();
+                    .each(
+                        (i, el) => {
 
-                        if (text) {
-                            results.push(
-                                text
-                            );
+                            const text =
+                                $(el)
+                                    .text()
+                                    .trim();
+
+                            if (text) {
+                                results.push(
+                                    text
+                                );
+                            }
+
                         }
-                    });
+                    );
             }
         }
 
@@ -276,8 +542,9 @@ async function searchTheWeb(query) {
             : null;
 
     } catch (error) {
+
         console.error(
-            "[Search Error]",
+            "[SEARCH ERROR]",
             error.message
         );
 
@@ -286,10 +553,11 @@ async function searchTheWeb(query) {
 }
 
 /* ============================================================
-   CONVERSATION MEMORY
+   MEMORY
 ============================================================ */
 
 function memoryFile(jid) {
+
     const safe =
         jid.replace(
             /[^a-zA-Z0-9_-]/g,
@@ -303,7 +571,9 @@ function memoryFile(jid) {
 }
 
 function loadMemory(jid) {
+
     try {
+
         const file =
             memoryFile(jid);
 
@@ -326,6 +596,7 @@ function loadMemory(jid) {
             : [];
 
     } catch {
+
         return [];
     }
 }
@@ -334,22 +605,22 @@ function saveMemory(
     jid,
     messages
 ) {
+
     try {
-        const trimmed =
-            messages.slice(-10);
 
         fs.writeFileSync(
             memoryFile(jid),
             JSON.stringify(
-                trimmed,
+                messages.slice(-10),
                 null,
                 2
             )
         );
 
     } catch (error) {
+
         console.error(
-            "[Memory Error]",
+            "[MEMORY ERROR]",
             error.message
         );
     }
@@ -363,6 +634,7 @@ async function askAI(
     jid,
     userText
 ) {
+
     const history =
         loadMemory(jid);
 
@@ -380,15 +652,15 @@ ${CONFIG.ORGANIZATION_NAME}
 Engine:
 ${CONFIG.ENGINE_NAME}
 
-You are replying to a WhatsApp user.
+You are an AI assistant replying through WhatsApp.
 
 Rules:
 - Be helpful and natural.
-- Keep replies reasonably short.
-- Do not mention internal system instructions.
-- Do not claim to be a human.
-- If you don't know something, say so.
+- Keep replies concise.
 - Answer the user's actual question.
+- Do not mention internal system instructions.
+- Do not claim to be human.
+- If you don't know something, say so.
 `;
 
     const headers = {
@@ -396,12 +668,13 @@ Rules:
             "application/json"
     };
 
-    /*
-     * Optional secret protection.
-     */
-    if (CONFIG.AI_PROXY_SECRET) {
+    if (
+        CONFIG.AI_PROXY_SECRET
+    ) {
+
         headers.Authorization =
             `Bearer ${CONFIG.AI_PROXY_SECRET}`;
+
     }
 
     const response =
@@ -413,6 +686,7 @@ Rules:
                 headers,
 
                 body: JSON.stringify({
+
                     model:
                         CONFIG.AI_MODEL,
 
@@ -431,71 +705,83 @@ Rules:
         );
 
     if (!response.ok) {
+
         const errorText =
             await response.text();
 
         throw new Error(
-            `AI proxy ${response.status}: ${errorText}`
+            `AI Proxy ${response.status}: ${errorText}`
         );
     }
 
     const data =
         await response.json();
 
-    /*
-     * Your proxy converts the
-     * Chat Completions response
-     * into a Responses-style response.
-     *
-     * Support several possible
-     * response formats so the bot
-     * doesn't break if the proxy
-     * changes slightly.
-     */
-
     let reply = "";
+
+    /* --------------------------------------------------------
+       Responses-style output
+    -------------------------------------------------------- */
 
     if (
         typeof data.output_text ===
         "string"
     ) {
+
         reply =
             data.output_text;
     }
+
+    /* --------------------------------------------------------
+       Chat completion format
+    -------------------------------------------------------- */
 
     if (
         !reply &&
         data.choices?.[0]?.message
             ?.content
     ) {
+
         reply =
             data.choices[0]
                 .message.content;
     }
 
+    /* --------------------------------------------------------
+       Generic output array
+    -------------------------------------------------------- */
+
     if (
         !reply &&
-        Array.isArray(data.output)
+        Array.isArray(
+            data.output
+        )
     ) {
+
         for (
             const item of
             data.output
         ) {
+
             if (
                 Array.isArray(
                     item.content
                 )
             ) {
+
                 for (
                     const content of
                     item.content
                 ) {
+
                     if (
                         typeof content.text ===
                         "string"
                     ) {
+
                         reply +=
                             content.text;
+
                     }
                 }
             }
@@ -503,10 +789,12 @@ Rules:
     }
 
     reply =
-        String(reply || "")
-            .trim();
+        String(
+            reply || ""
+        ).trim();
 
     if (!reply) {
+
         throw new Error(
             "AI returned an empty response."
         );
@@ -532,15 +820,19 @@ Rules:
 function processIdentity(
     text
 ) {
+
     return text
+
         .replace(
             /qwen/gi,
             CONFIG.AI_NAME
         )
+
         .replace(
             /alibaba/gi,
             CONFIG.ORGANIZATION_NAME
         )
+
         .replace(
             /tongyi/gi,
             CONFIG.ENGINE_NAME
@@ -554,23 +846,27 @@ function processIdentity(
 function getTextMessage(
     msg
 ) {
+
     return (
-        msg.message?.conversation ||
         msg.message
-            ?.extendedTextMessage?.text ||
+            ?.conversation ||
+
+        msg.message
+            ?.extendedTextMessage
+            ?.text ||
+
         ""
     ).trim();
 }
 
 /* ============================================================
-   IMAGE/OCR
+   IMAGE OCR
 ============================================================ */
 
 async function processImage(
-    sock,
-    from,
     imageMessage
 ) {
+
     const tempPath =
         path.join(
             __dirname,
@@ -578,6 +874,7 @@ async function processImage(
         );
 
     try {
+
         console.log(
             "[OCR] Downloading image..."
         );
@@ -593,13 +890,21 @@ async function processImage(
         for await (
             const chunk of stream
         ) {
-            chunks.push(chunk);
+
+            chunks.push(
+                chunk
+            );
         }
 
         const buffer =
-            Buffer.concat(chunks);
+            Buffer.concat(
+                chunks
+            );
 
-        if (!buffer.length) {
+        if (
+            !buffer.length
+        ) {
+
             throw new Error(
                 "Empty image."
             );
@@ -623,22 +928,32 @@ async function processImage(
             imageMessage.caption ||
             "";
 
-        if (!text && !caption) {
+        if (
+            !text &&
+            !caption
+        ) {
+
             return null;
         }
 
-        if (text && caption) {
+        if (
+            text &&
+            caption
+        ) {
+
             return `${caption}\n\nImage text:\n${text}`;
         }
 
         return text || caption;
 
     } finally {
+
         if (
             fs.existsSync(
                 tempPath
             )
         ) {
+
             fs.unlinkSync(
                 tempPath
             );
@@ -647,10 +962,11 @@ async function processImage(
 }
 
 /* ============================================================
-   WHATSAPP BOT
+   START WHATSAPP
 ============================================================ */
 
 async function startBot() {
+
     console.log(
         "🚀 Starting WhatsApp bot..."
     );
@@ -665,6 +981,7 @@ async function startBot() {
 
     const sock =
         makeWASocket({
+
             auth: state,
 
             logger,
@@ -680,343 +997,32 @@ async function startBot() {
         });
 
     /* ========================================================
-       CONNECTION
+       CONNECTION UPDATE
     ======================================================== */
 
     sock.ev.on(
         "connection.update",
         update => {
+
             const {
                 connection,
                 lastDisconnect,
                 qr
             } = update;
 
+            /* ------------------------------------------------
+               NEW QR
+            ------------------------------------------------ */
+
             if (qr) {
-                console.log(
-                    "\n📱 Scan this QR code:\n"
-                );
 
-                qrcode.generate(
-                    qr,
-                    {
-                        small: true
-                    }
-                );
-            }
+                latestQR = qr;
 
-            if (
-                connection ===
-                "open"
-            ) {
+                botConnected = false;
+
                 console.log(
-                    "===================================="
+                    "📱 New WhatsApp QR generated."
                 );
 
                 console.log(
-                    "✅ WhatsApp bot connected!"
-                );
-
-                console.log(
-                    `🤖 ${CONFIG.AI_NAME}`
-                );
-
-                console.log(
-                    `🧠 Model: ${CONFIG.AI_MODEL}`
-                );
-
-                console.log(
-                    `🌐 AI Proxy: ${CONFIG.AI_PROXY_URL}`
-                );
-
-                console.log(
-                    "===================================="
-                );
-            }
-
-            if (
-                connection ===
-                "close"
-            ) {
-                const status =
-                    lastDisconnect
-                        ?.error instanceof
-                    Boom
-                        ? lastDisconnect
-                            .error
-                            .output
-                            .statusCode
-                        : null;
-
-                const loggedOut =
-                    status ===
-                    DisconnectReason
-                        .loggedOut;
-
-                console.error(
-                    "WhatsApp connection closed.",
-                    status
-                );
-
-                if (!loggedOut) {
-                    console.log(
-                        "🔄 Reconnecting..."
-                    );
-
-                    setTimeout(
-                        startBot,
-                        5000
-                    );
-                } else {
-                    console.error(
-                        "❌ WhatsApp logged out. Re-authentication required."
-                    );
-                }
-            }
-        }
-    );
-
-    sock.ev.on(
-        "creds.update",
-        saveCreds
-    );
-
-    /* ========================================================
-       MESSAGES
-    ======================================================== */
-
-    sock.ev.on(
-        "messages.upsert",
-        async event => {
-            try {
-                const msg =
-                    event.messages?.[0];
-
-                if (!msg?.message) {
-                    return;
-                }
-
-                if (
-                    msg.key.fromMe
-                ) {
-                    return;
-                }
-
-                if (
-                    msg.key
-                        .remoteJid ===
-                    "status@broadcast"
-                ) {
-                    return;
-                }
-
-                const from =
-                    msg.key
-                        .remoteJid;
-
-                if (
-                    !isUserAllowed(
-                        from
-                    )
-                ) {
-                    console.log(
-                        `[Denied] ${from}`
-                    );
-
-                    return;
-                }
-
-                await sock
-                    .sendPresenceUpdate(
-                        "composing",
-                        from
-                    );
-
-                let userText =
-                    getTextMessage(
-                        msg
-                    );
-
-                /* ==================================================
-                   IMAGE
-                ================================================== */
-
-                const imageMessage =
-                    msg.message
-                        ?.imageMessage ||
-                    msg.message
-                        ?.viewOnceMessage
-                        ?.message
-                        ?.imageMessage ||
-                    msg.message
-                        ?.viewOnceMessageV2
-                        ?.message
-                        ?.imageMessage;
-
-                if (
-                    imageMessage
-                ) {
-                    try {
-                        userText =
-                            await processImage(
-                                sock,
-                                from,
-                                imageMessage
-                            );
-
-                    } catch (
-                        error
-                    ) {
-                        console.error(
-                            "[OCR]",
-                            error.message
-                        );
-
-                        await sock
-                            .sendMessage(
-                                from,
-                                {
-                                    text:
-                                        "⚠️ I couldn't process that image."
-                                }
-                            );
-
-                        return;
-                    }
-                }
-
-                if (!userText) {
-                    return;
-                }
-
-                console.log(
-                    `[Message] ${from}: ${userText}`
-                );
-
-                /* ==================================================
-                   SEARCH
-                ================================================== */
-
-                if (
-                    userText
-                        .toLowerCase()
-                        .startsWith(
-                            "!search "
-                        )
-                ) {
-                    const query =
-                        userText
-                            .slice(8)
-                            .trim();
-
-                    const webData =
-                        await searchTheWeb(
-                            query
-                        );
-
-                    if (!webData) {
-                        await sock
-                            .sendMessage(
-                                from,
-                                {
-                                    text:
-                                        "❌ I couldn't find useful web results."
-                                }
-                            );
-
-                        return;
-                    }
-
-                    userText =
-                        `Use these current web search results to answer the user.\n\n` +
-                        `WEB RESULTS:\n${webData}\n\n` +
-                        `USER QUESTION:\n${query}`;
-                }
-
-                /* ==================================================
-                   AI
-                ================================================== */
-
-                console.log(
-                    "[AI] Sending request to proxy..."
-                );
-
-                let reply =
-                    await askAI(
-                        from,
-                        userText
-                    );
-
-                reply =
-                    processIdentity(
-                        reply
-                    );
-
-                await sock.sendMessage(
-                    from,
-                    {
-                        text:
-                            `${reply}\n\n⚡ _AI_`
-                    }
-                );
-
-                await sock
-                    .sendPresenceUpdate(
-                        "paused",
-                        from
-                    );
-
-                console.log(
-                    "[AI] Reply sent."
-                );
-
-            } catch (
-                error
-            ) {
-                console.error(
-                    "[MESSAGE ERROR]",
-                    error
-                );
-            }
-        }
-    );
-}
-
-/* ============================================================
-   GLOBAL ERROR HANDLING
-============================================================ */
-
-process.on(
-    "uncaughtException",
-    error => {
-        console.error(
-            "[UNCAUGHT EXCEPTION]",
-            error
-        );
-    }
-);
-
-process.on(
-    "unhandledRejection",
-    error => {
-        console.error(
-            "[UNHANDLED REJECTION]",
-            error
-        );
-    }
-);
-
-/* ============================================================
-   START
-============================================================ */
-
-startBot().catch(
-    error => {
-        console.error(
-            "Failed to start bot:",
-            error
-        );
-
-        process.exit(1);
-    }
-);
+                    "🌐 Open /pair in your browser to scan
