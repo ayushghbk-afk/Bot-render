@@ -233,11 +233,132 @@ const server = http.createServer(async (req, res) => {
     const u = new URL(req.url, `http://${req.headers.host}`);
     if (req.method === "OPTIONS") { res.writeHead(204, {"Access-Control-Allow-Origin":"*","Access-Control-Allow-Headers":"Content-Type,X-Admin-Key"}); return res.end(); }
     if (u.pathname === "/health") return json(res, 200, { ok:true, connected:botConnected, uptime:process.uptime() });
-    if (u.pathname === "/pair") {
-      if (!latestQR) return res.end(`<meta name="viewport" content="width=device-width"><h2>${botConnected?"✅ Already connected":"⏳ Waiting for QR..."}</h2><script>setTimeout(()=>location.reload(),5000)</script>`);
-      const data = await QRCode.toDataURL(latestQR, {width:400,margin:2});
-      return res.end(`<meta name="viewport" content="width=device-width"><div style="text-align:center;font-family:Arial"><h2>📱 Scan with WhatsApp</h2><img style="max-width:90%" src="${data}"><p>WhatsApp → Linked devices → Link a device</p><button onclick="location.reload()">Refresh</button></div>`);
+    if (u.pathname === "/pair/qr") {
+      res.writeHead(200, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0"
+      });
+
+      if (botConnected) {
+        return res.end(JSON.stringify({ connected: true, qr: null }));
+      }
+
+      if (!latestQR) {
+        return res.end(JSON.stringify({ connected: false, qr: null }));
+      }
+
+      try {
+        const qrDataUrl = await QRCode.toDataURL(latestQR, {
+          width: 400,
+          margin: 2,
+          type: "image/png"
+        });
+
+        return res.end(JSON.stringify({
+          connected: false,
+          qr: qrDataUrl,
+          generatedAt: Date.now()
+        }));
+      } catch (err) {
+        console.error("[QR API ERROR]", err);
+        return res.end(JSON.stringify({
+          connected: false,
+          qr: null
+        }));
+      }
     }
+
+    if (u.pathname === "/pair") {
+      res.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0"
+      });
+
+      return res.end(`<!doctype html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-store">
+<title>WhatsApp Pairing</title>
+<style>
+body{font-family:Arial,sans-serif;text-align:center;background:#f5f5f5;padding:20px;margin:0}
+.card{background:#fff;display:inline-block;padding:20px;border-radius:16px;
+box-shadow:0 2px 12px #0002;max-width:460px;width:calc(100% - 40px)}
+#qr{width:min(400px,90vw);height:auto;display:block;margin:15px auto;border-radius:8px}
+.status{font-size:15px;color:#666;margin:12px}
+.ok{color:#087f3f;font-weight:bold}
+.small{font-size:13px;color:#777}
+</style>
+</head>
+<body>
+<div class="card">
+<h2>📱 Scan with WhatsApp</h2>
+<div id="status" class="status">⏳ Waiting for QR…</div>
+<img id="qr" alt="WhatsApp QR code" style="display:none">
+<p>WhatsApp → Linked devices → Link a device</p>
+<p class="small">QR automatically updates every 3 seconds.</p>
+</div>
+
+<script>
+let lastQR = "";
+
+async function updateQR() {
+  const status = document.getElementById("status");
+  const img = document.getElementById("qr");
+
+  try {
+    const r = await fetch("/pair/qr?cacheBust=" + Date.now(), {
+      cache: "no-store",
+      headers: { "Cache-Control": "no-cache" }
+    });
+
+    const data = await r.json();
+
+    if (data.connected) {
+      img.style.display = "none";
+      status.className = "status ok";
+      status.textContent = "✅ WhatsApp is connected!";
+      return;
+    }
+
+    if (data.qr) {
+      /*
+       * IMPORTANT:
+       * qr is already a complete data:image/png;base64,... URL.
+       * Put it directly into img.src — never print it as page text.
+       */
+      if (data.qr !== lastQR) {
+        img.src = data.qr;
+        lastQR = data.qr;
+      }
+
+      img.style.display = "block";
+      status.className = "status";
+      status.textContent = "📲 Scan this QR with WhatsApp";
+    } else {
+      img.style.display = "none";
+      status.className = "status";
+      status.textContent = "⏳ Waiting for WhatsApp to generate a QR…";
+    }
+  } catch (e) {
+    img.style.display = "none";
+    status.className = "status";
+    status.textContent = "⚠️ QR service error — retrying automatically…";
+    console.error(e);
+  }
+}
+
+updateQR();
+setInterval(updateQR, 3000);
+</script>
+</body>
+</html>`);
+    }
+
     if (u.pathname === "/" || u.pathname === "/dashboard") return res.end(dashboard());
     if (!auth(req)) return json(res, 401, {error:"Unauthorized. Set X-Admin-Key."});
 
