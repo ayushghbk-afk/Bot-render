@@ -5,7 +5,12 @@
   "scripts": {
     "start": "node index.js"
   },
-  "engines": {
-    "node": ">=20"
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "^6.7.18",
+    "cheerio": "^1.0.0",
+    "node-tesseract-ocr": "^2.2.1",
+    "pino": "^9.4.0",
+    "qrcode-terminal": "^0.12.0"
   }
 }
