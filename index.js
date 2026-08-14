@@ -215,19 +215,257 @@ function body(req) {
   });
 }
 function dashboard() {
-  const c = read("contacts"), t = read("templates"), s = read("schedules"), l = read("logs");
-  return `<!doctype html><html><head><meta name="viewport" content="width=device-width"><title>WhatsApp AI Bot v2</title>
-  <style>body{font-family:system-ui;margin:0;background:#f4f6f8;color:#17202a}main{max-width:1000px;margin:auto;padding:20px}.card{background:white;padding:18px;margin:12px 0;border-radius:14px;box-shadow:0 2px 8px #0001}input,textarea,button{padding:10px;margin:4px;border:1px solid #ccd;border-radius:8px}button{cursor:pointer}.ok{color:#087f3f}.bad{color:#b42318}pre{white-space:pre-wrap}</style></head>
-  <body><main><h1>🤖 WhatsApp AI Bot v2</h1><div class="card"><b>Status:</b> <span class="${botConnected?"ok":"bad"}">${botConnected?"Connected":"Offline"}</span><br><a href="/pair">📱 Pairing page</a> · <a href="/health">Health</a></div>
-  <div class="card"><h2>Contacts</h2><p>${Object.values(c).length} contacts · ${Object.values(c).filter(x=>x.optedIn&&!x.blocked).length} opted in</p>
-  <form method="post" action="/api/contact"><input name="jid" placeholder="919876543210" required><input name="name" placeholder="Name"><label><input type="checkbox" name="optedIn" checked> Opt in</label><button>Save</button></form></div>
-  <div class="card"><h2>Send message</h2><form method="post" action="/api/send"><input name="jid" placeholder="919876543210" required><textarea name="text" placeholder="Message" required></textarea><button>Send</button></form></div>
-  <div class="card"><h2>Templates</h2><form method="post" action="/api/templates"><textarea name="welcome" rows="3">${(t.welcome||"").replace(/</g,"&lt;")}</textarea><textarea name="away" rows="3">${(t.away||"").replace(/</g,"&lt;")}</textarea><button>Save templates</button></form></div>
-  <div class="card"><h2>Schedules</h2><form method="post" action="/api/schedule"><input name="jid" placeholder="919876543210" required><input name="at" type="datetime-local" required><textarea name="text" placeholder="Message" required></textarea><button>Schedule</button></form><pre>${JSON.stringify(s,null,2)}</pre></div>
-  <div class="card"><h2>AI controls</h2><p>Model: ${AI_MODEL}<br>Temperature: ${TEMPERATURE}<br>Max output: ${MAX_OUTPUT_TOKENS}<br>Working hours: ${process.env.WORK_START||"09:00"}–${process.env.WORK_END||"21:00"}</p></div>
-  <div class="card"><h2>Recent logs</h2><pre>${JSON.stringify(l.slice(-30),null,2)}</pre></div></main></body></html>`;
+  return `<!doctype html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WhatsApp AI Bot v2</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:system-ui,-apple-system,sans-serif;margin:0;background:#f4f6f8;color:#17202a}
+main{max-width:1000px;margin:auto;padding:16px}
+.card{background:#fff;padding:18px;margin:12px 0;border-radius:16px;box-shadow:0 2px 10px #0001}
+h1,h2{margin-top:0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
+button{padding:12px 14px;border:0;border-radius:10px;background:#111827;color:#fff;font-weight:600;cursor:pointer}
+button.secondary{background:#e8edf2;color:#17202a}
+button.danger{background:#b42318}
+input,textarea,select{width:100%;padding:11px;margin:5px 0;border:1px solid #ccd3da;border-radius:9px;font:inherit}
+textarea{min-height:90px;resize:vertical}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.hidden{display:none}
+.muted{color:#667085;font-size:14px}
+.ok{color:#087f3f;font-weight:700}
+.bad{color:#b42318;font-weight:700}
+.item{padding:10px;border:1px solid #e5e7eb;border-radius:10px;margin:7px 0}
+pre{white-space:pre-wrap;word-break:break-word;max-height:420px;overflow:auto}
+#toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:#111827;color:white;padding:11px 16px;border-radius:10px;display:none;z-index:9}
+</style>
+</head>
+<body>
+<main>
+<h1>🤖 WhatsApp AI Bot</h1>
+
+<div id="login" class="card">
+  <h2>🔐 Admin Login</h2>
+  <p class="muted">Enter the ADMIN_KEY you configured in Render.</p>
+  <input id="adminKey" type="password" placeholder="Admin key">
+  <button onclick="login()">Login</button>
+</div>
+
+<div id="app" class="hidden">
+  <div class="card">
+    <div class="grid">
+      <button onclick="show('send')">💬 Send Message</button>
+      <button onclick="show('contacts')">👥 Contacts</button>
+      <button onclick="show('schedule')">⏰ Schedule</button>
+      <button onclick="show('templates')">📝 Templates</button>
+      <button onclick="show('ai')">🤖 AI Controls</button>
+      <button onclick="show('logs')">📜 Logs</button>
+      <button class="secondary" onclick="window.open('/pair','_blank')">📱 Pair WhatsApp</button>
+      <button class="secondary" onclick="refreshAll()">🔄 Refresh</button>
+      <button class="danger" onclick="logout()">Logout</button>
+    </div>
+  </div>
+
+  <div id="status" class="card"></div>
+
+  <section id="send" class="card panel">
+    <h2>💬 Send Message</h2>
+    <input id="sendJid" placeholder="WhatsApp number e.g. 919876543210">
+    <textarea id="sendText" placeholder="Type your message..."></textarea>
+    <button onclick="sendMessage()">🚀 Send</button>
+  </section>
+
+  <section id="contacts" class="card panel hidden">
+    <h2>👥 Contacts</h2>
+    <div class="row">
+      <div><input id="contactJid" placeholder="919876543210"></div>
+      <div><input id="contactName" placeholder="Name"></div>
+    </div>
+    <label><input id="contactOpt" type="checkbox" checked> Opted in</label>
+    <button onclick="saveContact()">➕ Add / Update Contact</button>
+    <div id="contactList"></div>
+  </section>
+
+  <section id="schedule" class="card panel hidden">
+    <h2>⏰ Schedule Message</h2>
+    <input id="scheduleJid" placeholder="919876543210">
+    <input id="scheduleAt" type="datetime-local">
+    <textarea id="scheduleText" placeholder="Message to send later..."></textarea>
+    <button onclick="scheduleMessage()">📅 Schedule</button>
+    <div id="scheduleList"></div>
+  </section>
+
+  <section id="templates" class="card panel hidden">
+    <h2>📝 Templates</h2>
+    <label>Welcome message</label>
+    <textarea id="welcome"></textarea>
+    <label>Away message</label>
+    <textarea id="away"></textarea>
+    <button onclick="saveTemplates()">💾 Save Templates</button>
+  </section>
+
+  <section id="ai" class="card panel hidden">
+    <h2>🤖 AI Controls</h2>
+    <p><b>Model:</b> ${AI_MODEL}</p>
+    <p><b>Temperature:</b> ${TEMPERATURE}</p>
+    <p><b>Max output:</b> ${MAX_OUTPUT_TOKENS}</p>
+    <p><b>Working hours:</b> ${process.env.WORK_START || "09:00"} – ${process.env.WORK_END || "21:00"}</p>
+    <p class="muted">These values are controlled by Render environment variables.</p>
+  </section>
+
+  <section id="logs" class="card panel hidden">
+    <h2>📜 Recent Logs</h2>
+    <pre id="logsBox">Loading...</pre>
+  </section>
+</div>
+</main>
+<div id="toast"></div>
+
+<script>
+let KEY = sessionStorage.getItem("adminKey") || "";
+
+function toast(msg) {
+  const t=document.getElementById("toast");
+  t.textContent=msg;t.style.display="block";
+  setTimeout(()=>t.style.display="none",2500);
 }
 
+async function api(path, options={}) {
+  options.headers = Object.assign(
+    {"Content-Type":"application/json","X-Admin-Key":KEY},
+    options.headers || {}
+  );
+  const r=await fetch(path,options);
+  const data=await r.json().catch(()=>({}));
+  if(r.status===401){logout();throw new Error("Unauthorized");}
+  if(!r.ok) throw new Error(data.error || "Request failed");
+  return data;
+}
+
+async function login(){
+  KEY=document.getElementById("adminKey").value.trim();
+  if(!KEY) return toast("Enter your admin key");
+  sessionStorage.setItem("adminKey",KEY);
+  try{
+    await api("/api/contacts");
+    document.getElementById("login").classList.add("hidden");
+    document.getElementById("app").classList.remove("hidden");
+    refreshAll();
+    toast("✅ Logged in");
+  }catch(e){
+    sessionStorage.removeItem("adminKey"); KEY="";
+    toast("❌ Wrong admin key");
+  }
+}
+
+function logout(){
+  sessionStorage.removeItem("adminKey"); KEY="";
+  document.getElementById("app").classList.add("hidden");
+  document.getElementById("login").classList.remove("hidden");
+}
+
+function show(id){
+  document.querySelectorAll(".panel").forEach(x=>x.classList.add("hidden"));
+  document.getElementById(id).classList.remove("hidden");
+}
+
+async function refreshStatus(){
+  const d=await fetch("/health?x="+Date.now(),{cache:"no-store"}).then(r=>r.json());
+  document.getElementById("status").innerHTML =
+    "<b>Status:</b> <span class='"+(d.connected?"ok":"bad")+"'>"+
+    (d.connected?"🟢 WhatsApp Connected":"🔴 WhatsApp Offline")+
+    "</span><br><span class='muted'>Uptime: "+Math.floor(d.uptime/60)+" minutes</span>";
+}
+
+async function sendMessage(){
+  const jid=document.getElementById("sendJid").value;
+  const text=document.getElementById("sendText").value;
+  if(!jid||!text) return toast("Enter recipient and message");
+  try{await api("/api/send",{method:"POST",body:JSON.stringify({jid,text})});
+      document.getElementById("sendText").value="";toast("✅ Message sent");}
+  catch(e){toast("❌ "+e.message);}
+}
+
+async function saveContact(){
+  const jid=document.getElementById("contactJid").value;
+  const name=document.getElementById("contactName").value;
+  const optedIn=document.getElementById("contactOpt").checked;
+  try{await api("/api/contact",{method:"POST",body:JSON.stringify({jid,name,optedIn})});
+      toast("✅ Contact saved");loadContacts();}
+  catch(e){toast("❌ "+e.message);}
+}
+
+async function loadContacts(){
+  const c=await api("/api/contacts");
+  const arr=Object.values(c);
+  document.getElementById("contactList").innerHTML=arr.length?arr.map(x=>
+    "<div class='item'><b>"+escapeHtml(x.name||"Unnamed")+"</b><br>"+
+    escapeHtml(x.jid)+"<br>"+
+    (x.optedIn&&!x.blocked?"✅ Opted in":"🛑 Opted out")+"</div>").join("")
+    :"<p class='muted'>No contacts yet.</p>";
+}
+
+async function scheduleMessage(){
+  const jid=document.getElementById("scheduleJid").value;
+  const at=document.getElementById("scheduleAt").value;
+  const text=document.getElementById("scheduleText").value;
+  if(!jid||!at||!text) return toast("Fill all fields");
+  try{await api("/api/schedule",{method:"POST",body:JSON.stringify({jid,at,text})});
+      toast("⏰ Message scheduled");loadSchedules();}
+  catch(e){toast("❌ "+e.message);}
+}
+
+async function loadSchedules(){
+  const d=await api("/api/schedules");
+  document.getElementById("scheduleList").innerHTML=d.map(x=>
+    "<div class='item'>"+escapeHtml(x.at)+" → "+escapeHtml(x.jid)+"<br>"+
+    escapeHtml(x.text)+"<br>"+(x.sent?"✅ Sent":"⏳ Pending")+"</div>").join("") ||
+    "<p class='muted'>No scheduled messages.</p>";
+}
+
+async function loadTemplates(){
+  const t=await api("/api/templates");
+  document.getElementById("welcome").value=t.welcome||"";
+  document.getElementById("away").value=t.away||"";
+}
+
+async function saveTemplates(){
+  try{await api("/api/templates",{method:"POST",body:JSON.stringify({
+    welcome:document.getElementById("welcome").value,
+    away:document.getElementById("away").value
+  })});toast("✅ Templates saved");}
+  catch(e){toast("❌ "+e.message);}
+}
+
+async function loadLogs(){
+  const l=await api("/api/logs");
+  document.getElementById("logsBox").textContent=JSON.stringify(l,null,2);
+}
+
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));
+}
+
+async function refreshAll(){
+  try{
+    await refreshStatus();
+    await loadContacts();
+    await loadSchedules();
+    await loadTemplates();
+    await loadLogs();
+  }catch(e){toast("❌ "+e.message);}
+}
+
+if(KEY){
+  document.getElementById("adminKey").value=KEY;
+  login();
+}
+</script>
+</body>
+</html>`;
+}
 const server = http.createServer(async (req, res) => {
   try {
     const u = new URL(req.url, `http://${req.headers.host}`);
@@ -288,111 +526,4 @@ const server = http.createServer(async (req, res) => {
 body{font-family:Arial,sans-serif;text-align:center;background:#f5f5f5;padding:20px;margin:0}
 .card{background:#fff;display:inline-block;padding:20px;border-radius:16px;
 box-shadow:0 2px 12px #0002;max-width:460px;width:calc(100% - 40px)}
-#qr{width:min(400px,90vw);height:auto;display:block;margin:15px auto;border-radius:8px}
-.status{font-size:15px;color:#666;margin:12px}
-.ok{color:#087f3f;font-weight:bold}
-.small{font-size:13px;color:#777}
-</style>
-</head>
-<body>
-<div class="card">
-<h2>📱 Scan with WhatsApp</h2>
-<div id="status" class="status">⏳ Waiting for QR…</div>
-<img id="qr" alt="WhatsApp QR code" style="display:none">
-<p>WhatsApp → Linked devices → Link a device</p>
-<p class="small">QR automatically updates every 3 seconds.</p>
-</div>
-
-<script>
-let lastQR = "";
-
-async function updateQR() {
-  const status = document.getElementById("status");
-  const img = document.getElementById("qr");
-
-  try {
-    const r = await fetch("/pair/qr?cacheBust=" + Date.now(), {
-      cache: "no-store",
-      headers: { "Cache-Control": "no-cache" }
-    });
-
-    const data = await r.json();
-
-    if (data.connected) {
-      img.style.display = "none";
-      status.className = "status ok";
-      status.textContent = "✅ WhatsApp is connected!";
-      return;
-    }
-
-    if (data.qr) {
-      /*
-       * IMPORTANT:
-       * qr is already a complete data:image/png;base64,... URL.
-       * Put it directly into img.src — never print it as page text.
-       */
-      if (data.qr !== lastQR) {
-        img.src = data.qr;
-        lastQR = data.qr;
-      }
-
-      img.style.display = "block";
-      status.className = "status";
-      status.textContent = "📲 Scan this QR with WhatsApp";
-    } else {
-      img.style.display = "none";
-      status.className = "status";
-      status.textContent = "⏳ Waiting for WhatsApp to generate a QR…";
-    }
-  } catch (e) {
-    img.style.display = "none";
-    status.className = "status";
-    status.textContent = "⚠️ QR service error — retrying automatically…";
-    console.error(e);
-  }
-}
-
-updateQR();
-setInterval(updateQR, 3000);
-</script>
-</body>
-</html>`);
-    }
-
-    if (u.pathname === "/" || u.pathname === "/dashboard") return res.end(dashboard());
-    if (!auth(req)) return json(res, 401, {error:"Unauthorized. Set X-Admin-Key."});
-
-    const b = await body(req);
-    if (u.pathname === "/api/contact" && req.method === "POST") {
-      const jid = jidFromInput(b.jid); if (!jid) return json(res,400,{error:"Invalid JID/number"});
-      return json(res,200,setContact(jid,{name:b.name||"",optedIn:Boolean(b.optedIn),blocked:false}));
-    }
-    if (u.pathname === "/api/contacts" && req.method === "GET") return json(res,200,read("contacts"));
-    if (u.pathname === "/api/send" && req.method === "POST") {
-      const jid=jidFromInput(b.jid); await sendText(jid,String(b.text||""),"dashboard"); return json(res,200,{ok:true});
-    }
-    if (u.pathname === "/api/templates" && req.method === "POST") { write("templates",{welcome:String(b.welcome||""),away:String(b.away||"")}); return json(res,200,{ok:true}); }
-    if (u.pathname === "/api/schedule" && req.method === "POST") {
-      const s=read("schedules"); s.push({id:Date.now().toString(),jid:jidFromInput(b.jid),at:b.at,text:String(b.text||""),sent:false}); write("schedules",s); return json(res,200,{ok:true});
-    }
-    if (u.pathname === "/api/logs" && req.method === "GET") return json(res,200,read("logs").slice(-100));
-    return json(res,404,{error:"Not found"});
-  } catch(e) { log("http_error",{error:e.message}); return json(res,500,{error:e.message}); }
-});
-
-server.listen(PORT,"0.0.0.0",()=>console.log(`Dashboard listening on ${PORT}`));
-
-setInterval(async () => {
-  if (!sock || !botConnected) return;
-  const schedules=read("schedules"), now=Date.now();
-  let changed=false;
-  for (const job of schedules) {
-    if (!job.sent && Date.parse(job.at) <= now) {
-      try { await sendText(job.jid,job.text,"schedule"); job.sent=true; changed=true; }
-      catch(e) { job.error=e.message; job.sent=true; changed=true; log("schedule_error",{jid:job.jid,error:e.message}); }
-    }
-  }
-  if (changed) write("schedules",schedules);
-},15000);
-
-startBot().catch(e=>{ console.error(e); log("startup_error",{error:e.message}); });
+#qr{width:min(400px,90vw);height:a
