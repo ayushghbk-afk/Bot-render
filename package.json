@@ -1,7 +1,7 @@
 {
   "name": "whatsapp-ai-bot-v2",
-  "version": "2.0.0",
-  "description": "WhatsApp AI automation bot with dashboard, opt-in contacts, schedules, templates, working hours, STOP opt-out, logs and AI proxy.",
+  "version": "2.0.1",
+  "private": true,
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -11,7 +11,7 @@
   },
   "dependencies": {
     "@hapi/boom": "^10.0.1",
-    "@whiskeysockets/baileys": "^6.7.20",
+    "@whiskeysockets/baileys": "^6.7.18",
     "pino": "^9.7.0",
     "qrcode": "^1.5.4"
   }
