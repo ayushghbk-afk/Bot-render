@@ -6,6 +6,7 @@ const {
 const { Boom } = require("@hapi/boom");
 const QRCode = require("qrcode");
 const pino = require("pino");
+const logger = pino({ level: "silent" });
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
