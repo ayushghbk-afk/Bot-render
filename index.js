@@ -1,240 +1,265 @@
+
 const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason
 } = require("@whiskeysockets/baileys");
 const { Boom } = require("@hapi/boom");
-const QRCode = require("qrcode");
 const pino = require("pino");
-const logger = pino({ level: "silent" });
-const http = require("http");
+const QRCode = require("qrcode");
 const fs = require("fs");
 const path = require("path");
+const http = require("http");
+
+const logger = pino({ level: "silent" });
 
 const CONFIG = {
   PORT: Number(process.env.PORT || 3000),
-  ADMIN_KEY: process.env.ADMIN_KEY || "",
-  AI_PROXY_URL: process.env.AI_PROXY_URL || "",
-  AI_PROXY_SECRET: process.env.AI_PROXY_SECRET || "",
-  AI_MODEL: process.env.AI_MODEL || "openai/gpt-oss-120b",
-  AI_NAME: process.env.AI_NAME || "v1 of ayush",
-  ORGANIZATION_NAME: process.env.ORGANIZATION_NAME || "ayush development labs",
-  ENGINE_NAME: process.env.ENGINE_NAME || "v1 engine",
-  MAX_OUTPUT_TOKENS: Number(process.env.MAX_OUTPUT_TOKENS || 500),
-  TEMPERATURE: Number(process.env.TEMPERATURE || 0.7),
-  WHITELIST_ONLY: process.env.WHITELIST_ONLY !== "false",
-  ALLOWED_USERS: (process.env.ALLOWED_USERS || "").split(",").map(s => s.trim()).filter(Boolean),
   SESSION_DIR: process.env.SESSION_DIR || "./auth_session",
-  DATA_DIR: process.env.DATA_DIR || "./data"
+  ADMIN_KEY: process.env.ADMIN_KEY || "",
+  WHITELIST_ONLY: process.env.WHITELIST_ONLY !== "false",
+  ALLOWED_USERS: (process.env.ALLOWED_USERS || "")
+    .split(",").map(x => x.trim()).filter(Boolean)
 };
 
-for (const d of [CONFIG.SESSION_DIR, CONFIG.DATA_DIR]) fs.mkdirSync(d, { recursive: true });
-
-const files = {
-  contacts: path.join(CONFIG.DATA_DIR, "contacts.json"),
-  templates: path.join(CONFIG.DATA_DIR, "templates.json"),
-  schedules: path.join(CONFIG.DATA_DIR, "schedules.json"),
-  logs: path.join(CONFIG.DATA_DIR, "logs.json"),
-  settings: path.join(CONFIG.DATA_DIR, "settings.json")
-};
-
-function readJSON(file, fallback) {
-  try { return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : fallback; }
-  catch { return fallback; }
-}
-function writeJSON(file, value) {
-  fs.writeFileSync(file, JSON.stringify(value, null, 2));
-}
-function logEvent(type, details = {}) {
-  const logs = readJSON(files.logs, []);
-  logs.push({ time: new Date().toISOString(), type, ...details });
-  writeJSON(files.logs, logs.slice(-500));
-}
-function json(res, code, data) {
-  res.writeHead(code, {"Content-Type":"application/json; charset=utf-8"});
-  res.end(JSON.stringify(data));
-}
-function html(res, body) {
-  res.writeHead(200, {"Content-Type":"text/html; charset=utf-8"});
-  res.end(body);
-}
-function authorized(req) {
-  if (!CONFIG.ADMIN_KEY) return false;
-  return req.headers["x-admin-key"] === CONFIG.ADMIN_KEY;
-}
-async function body(req) {
-  return await new Promise((resolve, reject) => {
-    let s = "";
-    req.on("data", c => { s += c; if (s.length > 1e6) req.destroy(); });
-    req.on("end", () => {
-      try { resolve(s ? JSON.parse(s) : {}); } catch { resolve({}); }
-    });
-    req.on("error", reject);
-  });
-}
+fs.mkdirSync(CONFIG.SESSION_DIR, { recursive: true });
 
 let sock = null;
 let latestQR = null;
-let connected = false;
+let botConnected = false;
 let reconnecting = false;
 
-const dashboard = `<!doctype html>
-<html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WhatsApp AI Bot</title>
-<style>
-body{font-family:Arial;background:#f4f6f8;margin:0;padding:18px;color:#222}
-.card{max-width:900px;margin:auto;background:white;border-radius:16px;padding:20px;box-shadow:0 3px 16px #0001}
-button{padding:13px 16px;margin:5px;border:0;border-radius:10px;background:#111;color:white;font-size:15px}
-input,textarea,select{width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border:1px solid #ddd;border-radius:9px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px}
-section{display:none;margin-top:18px;padding-top:12px;border-top:1px solid #eee}
-section.active{display:block}
-pre{white-space:pre-wrap;background:#111;color:#eee;padding:12px;border-radius:10px;max-height:300px;overflow:auto}
-small{color:#666}
-</style></head><body><div class="card">
-<h1>🤖 WhatsApp AI Bot</h1><p id="status">Checking...</p>
-<div class="grid">
-<button onclick="show('send')">💬 Send Message</button>
-<button onclick="show('contacts')">👥 Contacts</button>
-<button onclick="show('schedule')">⏰ Schedule</button>
-<button onclick="show('templates')">📝 Templates</button>
-<button onclick="show('ai')">🤖 AI Controls</button>
-<button onclick="show('logs')">📜 Logs</button>
-<button onclick="location.href='/pair'">📱 Pair WhatsApp</button>
-<button onclick="location.reload()">🔄 Refresh</button>
-</div>
-<section id="send" class="active"><h2>💬 Send Message</h2>
-<input id="to" placeholder="919876543210@s.whatsapp.net">
-<textarea id="msg" rows="4" placeholder="Message"></textarea>
-<button onclick="sendMsg()">Send</button><p id="sendout"></p></section>
-<section id="contacts"><h2>👥 Contacts / Opt-in</h2>
-<input id="phone" placeholder="919876543210@s.whatsapp.net"><input id="cname" placeholder="Name">
-<button onclick="contact(true)">✅ Opt in</button><button onclick="contact(false)">🛑 Opt out</button><pre id="contactsout"></pre></section>
-<section id="schedule"><h2>⏰ Schedule</h2>
-<input id="sto" placeholder="Number/JID"><input id="stime" type="datetime-local">
-<textarea id="smsg" rows="3" placeholder="Message"></textarea><button onclick="schedule()">Schedule</button><pre id="scheduleout"></pre></section>
-<section id="templates"><h2>📝 Templates</h2>
-<input id="tname" placeholder="Template name"><textarea id="tbody" rows="3" placeholder="Template text"></textarea>
-<button onclick="template()">Save template</button><pre id="templatesout"></pre></section>
-<section id="ai"><h2>🤖 AI Controls</h2><p>Model and AI settings are controlled by Render environment variables.</p>
-<pre id="aiout"></pre></section>
-<section id="logs"><h2>📜 Logs</h2><button onclick="loadLogs()">Refresh logs</button><pre id="logsout"></pre></section>
-</div>
-<script>
-const key=prompt("Enter ADMIN_KEY")||"";
-async function api(url,opt={}){opt.headers=Object.assign({"Content-Type":"application/json","X-Admin-Key":key},opt.headers||{});let r=await fetch(url,opt);let d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||r.status);return d}
-function show(id){document.querySelectorAll("section").forEach(x=>x.classList.remove("active"));document.getElementById(id).classList.add("active");if(id==="contacts")loadContacts();if(id==="schedule")loadSchedules();if(id==="templates")loadTemplates();if(id==="ai")loadAI();if(id==="logs")loadLogs()}
-async function sendMsg(){try{let d=await api("/api/send",{method:"POST",body:JSON.stringify({to:to.value,text:msg.value})});sendout.textContent=d.message||"Sent"}catch(e){sendout.textContent="❌ "+e.message}}
-async function contact(opt){try{let d=await api("/api/contacts",{method:"POST",body:JSON.stringify({jid:phone.value,name:cname.value,optIn:opt})});contactsout.textContent=JSON.stringify(d,null,2);loadContacts()}catch(e){contactsout.textContent="❌ "+e.message}}
-async function loadContacts(){try{contactsout.textContent=JSON.stringify(await api("/api/contacts"),null,2)}catch(e){contactsout.textContent="❌ "+e.message}}
-async function schedule(){try{let d=await api("/api/schedules",{method:"POST",body:JSON.stringify({to:sto.value,text:smsg.value,at:stime.value})});scheduleout.textContent=JSON.stringify(d,null,2)}catch(e){scheduleout.textContent="❌ "+e.message}}
-async function loadSchedules(){try{scheduleout.textContent=JSON.stringify(await api("/api/schedules"),null,2)}catch(e){scheduleout.textContent="❌ "+e.message}}
-async function template(){try{let d=await api("/api/templates",{method:"POST",body:JSON.stringify({name:tname.value,text:tbody.value})});templatesout.textContent=JSON.stringify(d,null,2)}catch(e){templatesout.textContent="❌ "+e.message}}
-async function loadTemplates(){try{templatesout.textContent=JSON.stringify(await api("/api/templates"),null,2)}catch(e){templatesout.textContent="❌ "+e.message}}
-async function loadAI(){try{aiout.textContent=JSON.stringify(await api("/api/ai"),null,2)}catch(e){aiout.textContent="❌ "+e.message}}
-async function loadLogs(){try{logsout.textContent=JSON.stringify(await api("/api/logs"),null,2)}catch(e){logsout.textContent="❌ "+e.message}}
-async function status(){try{let d=await fetch("/health").then(r=>r.json());document.getElementById("status").textContent=(d.connected?"🟢 Connected":"🟡 Waiting for WhatsApp")+" | uptime "+Math.round(d.uptime)+"s"}catch{}}
-status();setInterval(status,5000);
-</script></body></html>`;
+const DATA_FILE = path.join(CONFIG.SESSION_DIR, "whitelist.json");
 
-function pairPage() {
-  if (connected) return `<!doctype html><html><body style="font-family:Arial;text-align:center;padding:40px"><h2>✅ WhatsApp Connected</h2><p>Bot is already paired.</p></body></html>`;
-  const image = latestQR ? `<img src="/qr.png?t=${Date.now()}" style="max-width:90%;width:420px">` : `<h2>Waiting for QR...</h2>`;
-  return `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="5"></head>
-<body style="font-family:Arial;text-align:center;background:#f4f6f8;padding:20px"><h2>📱 Scan with WhatsApp</h2>
-${image}<p>WhatsApp → Linked devices → Link a device</p><small>QR refreshes automatically every 5 seconds.</small></body></html>`;
+function loadWhitelist() {
+  try {
+    if (!fs.existsSync(DATA_FILE)) return [];
+    const data = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
 }
 
-const server = http.createServer(async (req,res) => {
-  const u = new URL(req.url, `http://${req.headers.host || "localhost"}`);
-  if (u.pathname === "/health") return json(res,200,{ok:true,connected,uptime:process.uptime(),time:new Date().toISOString()});
-  if (u.pathname === "/") return html(res, `<meta http-equiv="refresh" content="0;url=/dashboard">`);
-  if (u.pathname === "/dashboard") return html(res,dashboard);
-  if (u.pathname === "/pair") return html(res,pairPage());
-  if (u.pathname === "/qr.png") {
-    if (!latestQR) return json(res,404,{error:"QR not ready"});
-    res.writeHead(200,{"Content-Type":"image/png","Cache-Control":"no-store"});
-    return res.end(await QRCode.toBuffer(latestQR,{width:420,margin:2}));
+function saveWhitelist(list) {
+  fs.writeFileSync(DATA_FILE, JSON.stringify([...new Set(list)], null, 2));
+}
+
+function normalizeJid(value) {
+  let v = String(value || "").trim();
+  if (!v) return "";
+  if (v.includes("@s.whatsapp.net")) return v;
+  v = v.replace(/[^\d]/g, "");
+  return v ? `${v}@s.whatsapp.net` : "";
+}
+
+function getWhitelist() {
+  const stored = loadWhitelist();
+  const envUsers = CONFIG.ALLOWED_USERS.map(normalizeJid).filter(Boolean);
+  return [...new Set([...envUsers, ...stored])];
+}
+
+function isAllowed(jid) {
+  if (!CONFIG.WHITELIST_ONLY) return true;
+  return getWhitelist().includes(jid);
+}
+
+function adminAuthorized(req) {
+  if (!CONFIG.ADMIN_KEY) return false;
+  return req.headers["x-admin-key"] === CONFIG.ADMIN_KEY;
+}
+
+function sendJSON(res, code, data) {
+  res.writeHead(code, {"Content-Type":"application/json; charset=utf-8"});
+  res.end(JSON.stringify(data));
+}
+
+function dashboardHTML() {
+  return `<!doctype html>
+<html><head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WhatsApp Bot Admin</title>
+<style>
+body{font-family:Arial;margin:0;background:#f4f6f8;color:#222}
+main{max-width:650px;margin:auto;padding:20px}
+.card{background:#fff;border-radius:14px;padding:18px;margin:12px 0;box-shadow:0 2px 10px #0001}
+input,button{font-size:16px;padding:12px;border-radius:9px;border:1px solid #ccc;box-sizing:border-box}
+input{width:100%;margin:6px 0 10px}
+button{cursor:pointer;background:#111;color:#fff;border:0;margin:4px 2px}
+button.danger{background:#b00020}
+.row{display:flex;gap:6px}.row input{flex:1}
+li{margin:9px 0;word-break:break-all}
+small{color:#666}
+#status{padding:10px;background:#eef}
+</style></head>
+<body><main>
+<h2>🤖 WhatsApp Bot Admin</h2>
+<div class="card"><b>Whitelist</b><p><small>Add a WhatsApp number. Example: +91 9876543210</small></p>
+<div class="row"><input id="number" placeholder="+91 9876543210"><button onclick="addUser()">Add</button></div>
+<p id="status"></p></div>
+<div class="card"><b>Allowed users</b><ul id="users"><li>Loading...</li></ul></div>
+<div class="card"><button onclick="loadUsers()">🔄 Refresh</button> <button onclick="location.href='/pair'">📱 Pair WhatsApp</button></div>
+<script>
+function key(){return localStorage.getItem("adminKey")||prompt("Enter ADMIN_KEY");}
+async function api(url,opt={}){
+  const k=key(); if(k) localStorage.setItem("adminKey",k);
+  opt.headers=Object.assign({},opt.headers,{"X-Admin-Key":k||""});
+  const r=await fetch(url,opt); const d=await r.json();
+  if(r.status===401) throw Error("Unauthorized. Check ADMIN_KEY.");
+  return d;
+}
+async function loadUsers(){
+  try{
+    const d=await api("/api/whitelist");
+    document.getElementById("users").innerHTML=d.users.length
+      ? d.users.map(u=>"<li>"+u+" <button class='danger' onclick='removeUser("+JSON.stringify(u)+")'>Remove</button></li>").join("")
+      : "<li>No dashboard-added users.</li>";
+    document.getElementById("status").textContent="Whitelist mode: "+d.whitelistOnly;
+  }catch(e){document.getElementById("status").textContent=e.message}
+}
+async function addUser(){
+  const n=document.getElementById("number").value;
+  try{
+    const d=await api("/api/whitelist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({number:n})});
+    document.getElementById("number").value="";
+    document.getElementById("status").textContent=d.message;
+    loadUsers();
+  }catch(e){document.getElementById("status").textContent=e.message}
+}
+async function removeUser(n){
+  if(!confirm("Remove "+n+" from whitelist?")) return;
+  try{
+    const d=await api("/api/whitelist",{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({number:n})});
+    document.getElementById("status").textContent=d.message;
+    loadUsers();
+  }catch(e){document.getElementById("status").textContent=e.message}
+}
+loadUsers();
+</script></main></body></html>`;
+}
+
+function pairHTML() {
+  if (botConnected) return `<!doctype html><meta name="viewport" content="width=device-width"><div style="font-family:Arial;text-align:center;padding:30px"><h2>✅ WhatsApp Connected</h2><p>No QR scan needed.</p></div>`;
+  if (!latestQR) return `<!doctype html><meta name="viewport" content="width=device-width"><div style="font-family:Arial;text-align:center;padding:30px"><h2>📱 Waiting for QR...</h2><p>Auto-refreshing...</p><script>setTimeout(()=>location.reload(),3000)</script></div>`;
+  return `<!doctype html><html><head><meta name="viewport" content="width=device-width"><meta http-equiv="refresh" content="4"><title>WhatsApp Pairing</title></head><body style="font-family:Arial;text-align:center;padding:20px;background:#f4f4f4"><h2>📱 Scan with WhatsApp</h2><div style="background:#fff;padding:15px;display:inline-block;border-radius:15px"><img style="max-width:90vw;width:400px" src="/qr.png?t=${Date.now()}"></div><p>WhatsApp → Linked devices → Link a device</p><p>QR automatically refreshes every few seconds.</p></body></html>`;
+}
+
+const server = http.createServer(async (req,res)=>{
+  const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+
+  if(url.pathname === "/health")
+    return sendJSON(res,200,{ok:true,connected:botConnected,uptime:process.uptime()});
+
+  if(url.pathname === "/")
+    return sendJSON(res,200,{ok:true,service:"whatsapp-ai-bot",dashboard:"/dashboard",pair:"/pair"});
+
+  if(url.pathname === "/dashboard") {
+    if(!adminAuthorized(req)) return sendJSON(res,401,{error:"Unauthorized. Set X-Admin-Key."});
+    res.writeHead(200,{"Content-Type":"text/html; charset=utf-8"});
+    return res.end(dashboardHTML());
   }
-  if (u.pathname.startsWith("/api/")) {
-    if (!authorized(req)) return json(res,401,{error:"Unauthorized. Set X-Admin-Key."});
+
+  if(url.pathname === "/api/whitelist") {
+    if(!adminAuthorized(req)) return sendJSON(res,401,{error:"Unauthorized. Set X-Admin-Key."});
+    const list=loadWhitelist();
+    if(req.method==="GET") return sendJSON(res,200,{users:list,whitelistOnly:CONFIG.WHITELIST_ONLY});
+    let body="";
+    req.on("data",c=>body+=c);
+    req.on("end",()=>{
+      try{
+        const data=JSON.parse(body||"{}");
+        const jid=normalizeJid(data.number);
+        if(!jid) return sendJSON(res,400,{error:"Enter a valid WhatsApp number."});
+        let next=loadWhitelist();
+        if(req.method==="DELETE") {
+          next=next.filter(x=>x!==jid);
+          saveWhitelist(next);
+          return sendJSON(res,200,{ok:true,message:`Removed ${jid}`,users:next});
+        }
+        if(req.method!=="POST") return sendJSON(res,405,{error:"Method not allowed"});
+        if(!next.includes(jid)) next.push(jid);
+        saveWhitelist(next);
+        return sendJSON(res,200,{ok:true,message:`Added ${jid}`,users:next});
+      }catch(e){return sendJSON(res,400,{error:"Invalid JSON."});}
+    });
+    return;
+  }
+
+  if(url.pathname === "/pair") {
+    res.writeHead(200,{"Content-Type":"text/html; charset=utf-8"});
+    return res.end(pairHTML());
+  }
+
+  if(url.pathname === "/qr.png") {
+    if(!latestQR) {res.writeHead(404);return res.end("QR not ready");}
     try {
-      if (u.pathname === "/api/contacts") {
-        if(req.method==="POST"){const d=await body(req);if(!d.jid) return json(res,400,{error:"jid required"});let a=readJSON(files.contacts,[]);let x=a.find(c=>c.jid===d.jid);if(x)Object.assign(x,d);else a.push({jid:d.jid,name:d.name||"",optIn:!!d.optIn});writeJSON(files.contacts,a);logEvent("contact_update",{jid:d.jid,optIn:!!d.optIn});}
-        return json(res,200,readJSON(files.contacts,[]));
-      }
-      if (u.pathname === "/api/send" && req.method==="POST") {
-        const d=await body(req); if(!sock||!connected)return json(res,503,{error:"WhatsApp not connected"});
-        const contacts=readJSON(files.contacts,[]); const c=contacts.find(x=>x.jid===d.to);
-        if(!c || !c.optIn)return json(res,403,{error:"Recipient is not opted in"});
-        await sock.sendMessage(d.to,{text:String(d.text||"")}); logEvent("message_sent",{to:d.to}); return json(res,200,{ok:true,message:"Message sent"});
-      }
-      if (u.pathname === "/api/schedules") {
-        if(req.method==="POST"){const d=await body(req);if(!d.to||!d.text||!d.at)return json(res,400,{error:"to, text and at required"});let a=readJSON(files.schedules,[]);a.push({id:Date.now().toString(),to:d.to,text:d.text,at:d.at,sent:false});writeJSON(files.schedules,a);return json(res,200,{ok:true});}
-        return json(res,200,readJSON(files.schedules,[]));
-      }
-      if (u.pathname === "/api/templates") {
-        if(req.method==="POST"){const d=await body(req);if(!d.name||!d.text)return json(res,400,{error:"name and text required"});let a=readJSON(files.templates,[]);a.push({name:d.name,text:d.text});writeJSON(files.templates,a);return json(res,200,{ok:true});}
-        return json(res,200,readJSON(files.templates,[]));
-      }
-      if (u.pathname === "/api/logs") return json(res,200,readJSON(files.logs,[]).slice(-200));
-      if (u.pathname === "/api/ai") return json(res,200,{model:CONFIG.AI_MODEL,name:CONFIG.AI_NAME,maxOutputTokens:CONFIG.MAX_OUTPUT_TOKENS,temperature:CONFIG.TEMPERATURE,proxyConfigured:!!CONFIG.AI_PROXY_URL});
-      return json(res,404,{error:"Not found"});
-    } catch(e) { console.error(e); return json(res,500,{error:e.message}); }
+      const png=await QRCode.toBuffer(latestQR,{width:500,margin:2});
+      res.writeHead(200,{"Content-Type":"image/png","Cache-Control":"no-store"});
+      return res.end(png);
+    } catch(e){res.writeHead(500);return res.end("QR error");}
   }
-  json(res,404,{error:"Not found"});
+
+  res.writeHead(404); res.end("Not found");
 });
 
 server.listen(CONFIG.PORT,"0.0.0.0",()=>console.log(`🌐 HTTP server listening on ${CONFIG.PORT}`));
 
-async function startBot(){
+async function startBot() {
   const {state,saveCreds}=await useMultiFileAuthState(CONFIG.SESSION_DIR);
-  sock=makeWASocket({auth:state,logger,browser:["Online AI Bot","Chrome","1.0.0"],syncFullHistory:false});
+  sock=makeWASocket({
+    auth:state,
+    logger,
+    browser:["Online AI Bot","Chrome","1.0.0"],
+    syncFullHistory:false
+  });
+
   sock.ev.on("creds.update",saveCreds);
-  sock.ev.on("connection.update", async ({connection,lastDisconnect,qr})=>{
-    if(qr){latestQR=qr;connected=false;console.log("📱 New QR available at /pair");}
-    if(connection==="open"){connected=true;latestQR=null;console.log("✅ WhatsApp connected");logEvent("whatsapp_connected");}
+
+  sock.ev.on("connection.update",async ({connection,lastDisconnect,qr})=>{
+    if(qr){latestQR=qr;botConnected=false;console.log("📱 New QR generated");}
+    if(connection==="open"){botConnected=true;latestQR=null;console.log("✅ WhatsApp connected");}
     if(connection==="close"){
-      connected=false;
-      const code=lastDisconnect?.error instanceof Boom ? lastDisconnect.error.output?.statusCode : 0;
-      if(code!==DisconnectReason.loggedOut && !reconnecting){reconnecting=true;setTimeout(()=>{reconnecting=false;startBot().catch(console.error)},5000);}
-      else if(code===DisconnectReason.loggedOut) console.log("❌ WhatsApp logged out; remove auth_session to pair again.");
+      botConnected=false;
+      const code=new Boom(lastDisconnect?.error)?.output?.statusCode;
+      if(code!==DisconnectReason.loggedOut && !reconnecting){
+        reconnecting=true;
+        setTimeout(()=>{reconnecting=false;startBot().catch(console.error)},3000);
+      }
     }
   });
+
   sock.ev.on("messages.upsert",async ({messages})=>{
-    const msg=messages?.[0]; if(!msg?.message||msg.key.fromMe)return;
-    const from=msg.key.remoteJid; if(!from||from==="status@broadcast")return;
-    const text=(msg.message.conversation||msg.message.extendedTextMessage?.text||"").trim();
-    if(!text)return;
-    const contacts=readJSON(files.contacts,[]);
-    let c=contacts.find(x=>x.jid===from);
-    if(/^(stop|unsubscribe|cancel)$/i.test(text)){if(c)c.optIn=false;else contacts.push({jid:from,optIn:false});writeJSON(files.contacts,contacts);await sock.sendMessage(from,{text:"You have been opted out. Send START to opt in again."});return;}
-    if(/^start$/i.test(text)){if(c)c.optIn=true;else contacts.push({jid:from,optIn:true});writeJSON(files.contacts,contacts);await sock.sendMessage(from,{text:"You are opted in again."});return;}
-    if(CONFIG.WHITELIST_ONLY&&!CONFIG.ALLOWED_USERS.includes(from))return;
-    if(!CONFIG.AI_PROXY_URL)return;
-    try{
-      const contacts2=readJSON(files.contacts,[]); const contact=contacts2.find(x=>x.jid===from);
-      if(!contact?.optIn)return;
-      const headers={"Content-Type":"application/json"}; if(CONFIG.AI_PROXY_SECRET)headers.Authorization=`Bearer ${CONFIG.AI_PROXY_SECRET}`;
-      const r=await fetch(CONFIG.AI_PROXY_URL,{method:"POST",headers,body:JSON.stringify({model:CONFIG.AI_MODEL,instructions:`You are ${CONFIG.AI_NAME}. Be helpful, concise and natural on WhatsApp.`,messages:[{role:"user",content:text}],max_output_tokens:CONFIG.MAX_OUTPUT_TOKENS,temperature:CONFIG.TEMPERATURE})});
-      if(!r.ok)throw new Error(`AI ${r.status}`);
-      const d=await r.json();let reply=d.output_text||d.choices?.[0]?.message?.content||"";
-      if(reply){await sock.sendMessage(from,{text:String(reply).trim()});logEvent("ai_reply",{to:from});}
-    }catch(e){console.error("[AI]",e.message);logEvent("ai_error",{error:e.message});}
+    const msg=messages?.[0];
+    if(!msg || msg.key.fromMe) return;
+    const jid=msg.key.remoteJid;
+    if(!jid || jid.endsWith("@g.us")) return;
+
+    if(!isAllowed(jid)){
+      console.log(`🚫 Whitelist blocked: ${jid}`);
+      return;
+    }
+
+    const text=(msg.message?.conversation || msg.message?.extendedTextMessage?.text || "").trim();
+    if(!text) return;
+
+    if(/^stop$/i.test(text)){
+      const list=getWhitelist().filter(x=>x!==jid);
+      saveWhitelist(list.filter(x=>!CONFIG.ALLOWED_USERS.map(normalizeJid).includes(x)));
+      await sock.sendMessage(jid,{text:"🛑 Opt-out received. You will no longer receive bot replies."});
+      return;
+    }
+
+    if(/^start$/i.test(text)){
+      const list=loadWhitelist();
+      if(!list.includes(jid)) list.push(jid);
+      saveWhitelist(list);
+      await sock.sendMessage(jid,{text:"✅ You are opted in again."});
+      return;
+    }
+
+    // Simple automatic reply; replace with your AI function if desired.
+    await sock.sendMessage(jid,{text:"🤖 Message received! Your number is whitelisted."});
   });
 }
 
-setInterval(async()=>{
-  if(!sock||!connected)return;
-  const a=readJSON(files.schedules,[]);let changed=false;const now=Date.now();
-  for(const x of a){
-    if(x.sent)continue;
-    const t=new Date(x.at).getTime(); if(!Number.isFinite(t)||t>now)continue;
-    const c=readJSON(files.contacts,[]).find(c=>c.jid===x.to);
-    if(!c?.optIn){x.sent=true;changed=true;logEvent("scheduled_skipped",{to:x.to,reason:"not_opted_in"});continue;}
-    try{await sock.sendMessage(x.to,{text:x.text});x.sent=true;changed=true;logEvent("scheduled_sent",{to:x.to});}catch(e){logEvent("scheduled_error",{to:x.to,error:e.message});}
-  }
-  if(changed)writeJSON(files.schedules,a);
-},5000);
-
-startBot().catch(e=>{console.error("Fatal:",e);process.exit(1);});
+startBot().catch(err=>{console.error("Fatal:",err);process.exit(1);});
