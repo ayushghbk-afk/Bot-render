@@ -5,17 +5,17 @@ const {
 } = require("@whiskeysockets/baileys");
 
 const { Boom } = require("@hapi/boom");
+const { createClient } = require("@supabase/supabase-js");
 const pino = require("pino");
 const QRCode = require("qrcode");
+const fs = require("fs");
 const http = require("http");
-
-const { createClient } = require("@supabase/supabase-js");
 
 const logger = pino({ level: "silent" });
 
-/* ============================================================
+/* =========================================================
    CONFIG
-============================================================ */
+========================================================= */
 
 const CONFIG = {
   PORT: Number(process.env.PORT || 3000),
@@ -26,14 +26,11 @@ const CONFIG = {
   ADMIN_KEY:
     process.env.ADMIN_KEY || "",
 
-  WHITELIST_ONLY:
-    process.env.WHITELIST_ONLY !== "false",
+  SUPABASE_URL:
+    process.env.SUPABASE_URL || "",
 
-  ALLOWED_USERS:
-    (process.env.ALLOWED_USERS || "")
-      .split(",")
-      .map(x => x.trim())
-      .filter(Boolean),
+  SUPABASE_SECRET_KEY:
+    process.env.SUPABASE_SECRET_KEY || "",
 
   AI_PROXY_URL:
     process.env.AI_PROXY_URL ||
@@ -45,335 +42,228 @@ const CONFIG = {
 
   AI_NAME:
     process.env.AI_NAME ||
-    "v1 of ayush",
+    "Ayush AI",
 
-  MAX_OUTPUT_TOKENS:
-    Number(process.env.MAX_OUTPUT_TOKENS || 2048),
+  WHITELIST_ONLY:
+    process.env.WHITELIST_ONLY !== "false",
 
-  TEMPERATURE:
-    Number(process.env.TEMPERATURE || 0.7)
+  MAX_HISTORY:
+    Number(process.env.MAX_HISTORY || 10)
 };
 
+/* =========================================================
+   REQUIRED ENVIRONMENT VARIABLES
+========================================================= */
 
-/* ============================================================
-   SUPABASE
-============================================================ */
-
-const SUPABASE_URL =
-  process.env.SUPABASE_URL;
-
-const SUPABASE_SECRET_KEY =
-  process.env.SUPABASE_SECRET_KEY;
-
-if (!SUPABASE_URL) {
+if (!CONFIG.SUPABASE_URL) {
   console.error("❌ SUPABASE_URL is missing");
   process.exit(1);
 }
 
-if (!SUPABASE_SECRET_KEY) {
+if (!CONFIG.SUPABASE_SECRET_KEY) {
   console.error("❌ SUPABASE_SECRET_KEY is missing");
   process.exit(1);
 }
 
+if (!CONFIG.ADMIN_KEY) {
+  console.error("❌ ADMIN_KEY is missing");
+  process.exit(1);
+}
+
+/* =========================================================
+   SUPABASE
+========================================================= */
+
 const supabase = createClient(
-  SUPABASE_URL,
-  SUPABASE_SECRET_KEY,
+  CONFIG.SUPABASE_URL,
+  CONFIG.SUPABASE_SECRET_KEY,
   {
     auth: {
-      persistSession: false,
-      autoRefreshToken: false
+      autoRefreshToken: false,
+      persistSession: false
     }
   }
 );
 
+console.log("✅ Supabase initialized");
 
-/* ============================================================
-   GLOBAL STATE
-============================================================ */
+/* =========================================================
+   WHATSAPP STATE
+========================================================= */
+
+fs.mkdirSync(CONFIG.SESSION_DIR, {
+  recursive: true
+});
 
 let sock = null;
 let latestQR = null;
 let botConnected = false;
 let reconnecting = false;
 
-
-/* ============================================================
-   JID
-============================================================ */
+/* =========================================================
+   HELPERS
+========================================================= */
 
 function normalizeJid(value) {
   let v = String(value || "").trim();
 
   if (!v) return "";
 
-  if (v.includes("@s.whatsapp.net")) {
+  if (v.endsWith("@s.whatsapp.net")) {
     return v;
   }
 
   v = v.replace(/[^\d]/g, "");
 
-  return v
-    ? `${v}@s.whatsapp.net`
-    : "";
+  if (!v) return "";
+
+  return `${v}@s.whatsapp.net`;
 }
 
+function sendJSON(res, status, data) {
+  res.writeHead(status, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store"
+  });
 
-/* ============================================================
-   USERS
-============================================================ */
+  res.end(JSON.stringify(data));
+}
 
-async function getUser(jid) {
+/* =========================================================
+   ADMIN AUTH
+========================================================= */
+
+function adminAuthorized(req) {
+  const key =
+    req.headers["x-admin-key"];
+
+  return Boolean(
+    CONFIG.ADMIN_KEY &&
+    key &&
+    key === CONFIG.ADMIN_KEY
+  );
+}
+
+/*
+ IMPORTANT:
+
+ /dashboard itself is NOT protected.
+
+ The page contains the login box.
+
+ Only /api/* endpoints require ADMIN_KEY.
+
+ This fixes the previous:
+ {"error":"Unauthorized"}
+ problem when opening /dashboard directly.
+*/
+
+/* =========================================================
+   SUPABASE WHITELIST
+========================================================= */
+
+async function getWhitelist() {
   const { data, error } =
     await supabase
-      .from("users")
-      .select("*")
-      .eq("phone", jid)
-      .maybeSingle();
+      .from("bot_users")
+      .select("jid,allowed")
+      .eq("allowed", true);
 
   if (error) {
     console.error(
-      "Supabase getUser error:",
-      error.message
+      "Whitelist read error:",
+      error
     );
 
-    return null;
+    throw error;
   }
 
-  return data;
+  return (data || []).map(
+    row => row.jid
+  );
 }
-
-
-async function ensureUser(jid) {
-  const existing =
-    await getUser(jid);
-
-  if (existing) {
-    await supabase
-      .from("users")
-      .update({
-        last_seen_at:
-          new Date().toISOString()
-      })
-      .eq("phone", jid);
-
-    return existing;
-  }
-
-  const envAllowed =
-    CONFIG.ALLOWED_USERS
-      .map(normalizeJid)
-      .includes(jid);
-
-  const { data, error } =
-    await supabase
-      .from("users")
-      .insert({
-        phone: jid,
-        is_allowed: envAllowed,
-        last_seen_at:
-          new Date().toISOString()
-      })
-      .select()
-      .single();
-
-  if (error) {
-    console.error(
-      "Supabase create user error:",
-      error.message
-    );
-
-    return null;
-  }
-
-  return data;
-}
-
 
 async function isAllowed(jid) {
   if (!CONFIG.WHITELIST_ONLY) {
     return true;
   }
 
-  const user =
-    await ensureUser(jid);
-
-  if (!user) {
-    return false;
-  }
-
-  const envAllowed =
-    CONFIG.ALLOWED_USERS
-      .map(normalizeJid)
-      .includes(jid);
-
-  return Boolean(
-    user.is_allowed ||
-    user.is_admin ||
-    envAllowed
-  );
-}
-
-
-/* ============================================================
-   WHITELIST
-============================================================ */
-
-async function getWhitelist() {
   const { data, error } =
     await supabase
-      .from("users")
-      .select("phone")
-      .eq("is_allowed", true);
+      .from("bot_users")
+      .select("allowed")
+      .eq("jid", jid)
+      .maybeSingle();
 
   if (error) {
     console.error(
-      "Whitelist error:",
-      error.message
+      "Whitelist check error:",
+      error
     );
 
-    return [];
+    return false;
   }
 
-  const databaseUsers =
-    (data || []).map(x => x.phone);
-
-  const environmentUsers =
-    CONFIG.ALLOWED_USERS
-      .map(normalizeJid)
-      .filter(Boolean);
-
-  return [
-    ...new Set([
-      ...databaseUsers,
-      ...environmentUsers
-    ])
-  ];
+  return Boolean(
+    data &&
+    data.allowed === true
+  );
 }
-
 
 async function addWhitelist(jid) {
   const { error } =
     await supabase
-      .from("users")
+      .from("bot_users")
       .upsert(
         {
-          phone: jid,
-          is_allowed: true,
-          last_seen_at:
-            new Date().toISOString()
+          jid,
+          allowed: true
         },
         {
-          onConflict: "phone"
+          onConflict: "jid"
         }
       );
 
-  return !error;
+  if (error) {
+    throw error;
+  }
 }
-
 
 async function removeWhitelist(jid) {
   const { error } =
     await supabase
-      .from("users")
+      .from("bot_users")
       .update({
-        is_allowed: false
+        allowed: false
       })
-      .eq("phone", jid);
-
-  return !error;
-}
-
-
-/* ============================================================
-   MESSAGE STORAGE
-============================================================ */
-
-async function saveMessage(
-  jid,
-  role,
-  content
-) {
-  const { error } =
-    await supabase
-      .from("messages")
-      .insert({
-        phone: jid,
-        role,
-        content
-      });
+      .eq("jid", jid);
 
   if (error) {
-    console.error(
-      "Message save error:",
-      error.message
-    );
+    throw error;
   }
 }
 
-
-async function getConversation(jid) {
-  const { data, error } =
-    await supabase
-      .from("messages")
-      .select("role,content")
-      .eq("phone", jid)
-      .order("created_at", {
-        ascending: false
-      })
-      .limit(20);
-
-  if (error) {
-    console.error(
-      "Conversation load error:",
-      error.message
-    );
-
-    return [];
-  }
-
-  return (data || [])
-    .reverse()
-    .filter(
-      x =>
-        x.content &&
-        ["user", "assistant", "system"]
-          .includes(x.role)
-    );
-}
-
-
-async function clearConversation(jid) {
-  const { error } =
-    await supabase
-      .from("messages")
-      .delete()
-      .eq("phone", jid);
-
-  return !error;
-}
-
-
-/* ============================================================
+/* =========================================================
    LOGGING
-============================================================ */
+========================================================= */
 
-async function logEvent(
-  level,
-  event,
-  phone = null,
-  details = null
+async function logMessage(
+  jid,
+  direction,
+  message
 ) {
-  const { error } =
+  try {
     await supabase
       .from("bot_logs")
       .insert({
-        level,
-        event,
-        phone,
-        details
+        jid,
+        direction,
+        message: String(message).slice(
+          0,
+          12000
+        )
       });
-
-  if (error) {
+  } catch (error) {
     console.error(
       "Log error:",
       error.message
@@ -381,36 +271,87 @@ async function logEvent(
   }
 }
 
+/* =========================================================
+   MESSAGE HISTORY
+========================================================= */
 
-/* ============================================================
-   AI
-============================================================ */
-
-async function askAI(
+async function saveHistory(
   jid,
-  userText
+  role,
+  content
 ) {
+  try {
+    await supabase
+      .from("bot_messages")
+      .insert({
+        jid,
+        role,
+        content: String(content).slice(
+          0,
+          12000
+        )
+      });
+  } catch (error) {
+    console.error(
+      "History save error:",
+      error.message
+    );
+  }
+}
+
+async function getHistory(jid) {
+  const { data, error } =
+    await supabase
+      .from("bot_messages")
+      .select("role,content,created_at")
+      .eq("jid", jid)
+      .order("created_at", {
+        ascending: false
+      })
+      .limit(CONFIG.MAX_HISTORY);
+
+  if (error) {
+    console.error(
+      "History read error:",
+      error
+    );
+
+    return [];
+  }
+
+  return (data || [])
+    .reverse()
+    .map(row => ({
+      role: row.role,
+      content: row.content
+    }));
+}
+
+async function clearHistory(jid) {
+  const { error } =
+    await supabase
+      .from("bot_messages")
+      .delete()
+      .eq("jid", jid);
+
+  if (error) {
+    throw error;
+  }
+}
+
+/* =========================================================
+   AI
+========================================================= */
+
+async function askAI(jid, text) {
   const history =
-    await getConversation(jid);
+    await getHistory(jid);
 
-  const instructions = `
-You are ${CONFIG.AI_NAME}, a WhatsApp AI assistant.
-
-Be helpful, concise and friendly.
-
-You are running inside a WhatsApp bot.
-
-Do not claim that you performed an action unless you actually did it.
-
-Current user:
-${jid}
-`;
-
-  const messages = [
+  const input = [
     ...history,
     {
       role: "user",
-      content: userText
+      content: text
     }
   ];
 
@@ -426,52 +367,66 @@ ${jid}
         },
 
         body: JSON.stringify({
-          model:
-            CONFIG.AI_MODEL,
+          model: CONFIG.AI_MODEL,
 
-          instructions,
+          instructions:
+            `You are ${CONFIG.AI_NAME}, a helpful WhatsApp AI assistant. ` +
+            `Reply naturally and concisely for WhatsApp. ` +
+            `Do not mention internal systems, API keys, Supabase, or proxy details.`,
 
-          messages,
+          input,
 
-          max_output_tokens:
-            CONFIG.MAX_OUTPUT_TOKENS,
+          max_output_tokens: 2048,
 
-          temperature:
-            CONFIG.TEMPERATURE
+          temperature: 0.7
         })
       }
     );
 
-  let data = null;
+  const raw =
+    await response.text();
+
+  let data;
 
   try {
-    data =
-      await response.json();
+    data = JSON.parse(raw);
   } catch {
     throw new Error(
-      `AI returned invalid JSON (${response.status})`
+      `AI returned invalid JSON: ${raw.slice(0, 500)}`
     );
   }
 
   if (!response.ok) {
     throw new Error(
       data?.error?.message ||
-      data?.message ||
-      `AI request failed (${response.status})`
+      data?.error ||
+      `AI HTTP ${response.status}`
     );
   }
 
-  /*
-    Your Worker converts the Groq Chat Completions
-    response into a Responses-style object.
+  let answer =
+    data?.output_text ||
+    "";
 
-    Prefer output_text.
+  /*
+   Fallback for normal chat-completion
+   responses.
   */
 
-  let answer =
-    data?.output_text || "";
+  if (!answer) {
+    answer =
+      data?.choices?.[0]?.message?.content ||
+      "";
+  }
 
-  if (!answer && Array.isArray(data?.output)) {
+  /*
+   Fallback for Responses-style output.
+  */
+
+  if (
+    !answer &&
+    Array.isArray(data?.output)
+  ) {
     for (const item of data.output) {
       if (
         item?.type === "message" &&
@@ -489,773 +444,841 @@ ${jid}
     }
   }
 
-  /*
-    Fallback in case the Worker returns the original
-    Chat Completions response.
-  */
-
-  if (
-    !answer &&
-    data?.choices?.[0]?.message?.content
-  ) {
-    answer =
-      data.choices[0].message.content;
-  }
-
   answer = String(answer || "").trim();
 
   if (!answer) {
     throw new Error(
-      "AI returned an empty response."
+      "AI returned an empty response"
     );
   }
 
-  return {
-    text: answer,
-    usage: data?.usage || null,
-    model:
-      data?.model ||
-      CONFIG.AI_MODEL
-  };
-}
-
-
-/* ============================================================
-   ADMIN
-============================================================ */
-
-function adminAuthorized(req) {
-  if (!CONFIG.ADMIN_KEY) {
-    return false;
-  }
-
-  return (
-    req.headers["x-admin-key"] ===
-    CONFIG.ADMIN_KEY
-  );
-}
-
-
-function sendJSON(
-  res,
-  code,
-  data
-) {
-  res.writeHead(
-    code,
-    {
-      "Content-Type":
-        "application/json; charset=utf-8"
-    }
+  await saveHistory(
+    jid,
+    "user",
+    text
   );
 
-  res.end(
-    JSON.stringify(data)
+  await saveHistory(
+    jid,
+    "assistant",
+    answer
   );
+
+  return answer;
 }
 
-
-/* ============================================================
+/* =========================================================
    DASHBOARD
-============================================================ */
+========================================================= */
 
 function dashboardHTML() {
   return `<!doctype html>
+
 <html>
+
 <head>
+
 <meta name="viewport"
 content="width=device-width,initial-scale=1">
 
-<title>WhatsApp AI Bot Admin</title>
+<title>WhatsApp AI Bot</title>
 
 <style>
+
 body{
-font-family:Arial;
-margin:0;
-background:#f4f6f8;
-color:#222
+  font-family:Arial,sans-serif;
+  background:#f3f4f6;
+  margin:0;
+  color:#111;
 }
 
 main{
-max-width:650px;
-margin:auto;
-padding:20px
+  max-width:700px;
+  margin:auto;
+  padding:20px;
 }
 
 .card{
-background:#fff;
-border-radius:14px;
-padding:18px;
-margin:12px 0;
-box-shadow:0 2px 10px #0001
+  background:white;
+  padding:18px;
+  margin:12px 0;
+  border-radius:16px;
+  box-shadow:0 2px 10px #0001;
 }
 
 input,button{
-font-size:16px;
-padding:12px;
-border-radius:9px;
-border:1px solid #ccc;
-box-sizing:border-box
-}
-
-input{
-width:100%;
-margin:6px 0 10px
+  width:100%;
+  box-sizing:border-box;
+  padding:13px;
+  margin:6px 0;
+  font-size:16px;
+  border-radius:10px;
+  border:1px solid #ccc;
 }
 
 button{
-cursor:pointer;
-background:#111;
-color:#fff;
-border:0;
-margin:4px 2px
+  background:#111;
+  color:white;
+  border:0;
+  cursor:pointer;
 }
 
 button.danger{
-background:#b00020
+  background:#c62828;
 }
 
-.row{
-display:flex;
-gap:6px
+.hidden{
+  display:none;
 }
 
-.row input{
-flex:1
+.user{
+  padding:10px;
+  border-bottom:1px solid #ddd;
+  word-break:break-all;
 }
 
-li{
-margin:9px 0;
-word-break:break-all
+.status{
+  padding:10px;
+  border-radius:8px;
+  background:#eef2ff;
+  margin-top:10px;
 }
 
-small{
-color:#666
-}
-
-#status{
-padding:10px;
-background:#eef
-}
 </style>
+
 </head>
 
 <body>
+
 <main>
 
-<h2>🤖 WhatsApp AI Bot Admin</h2>
+<h2>🤖 WhatsApp AI Bot</h2>
+
+<div id="login" class="card">
+
+<h3>🔐 Admin Login</h3>
+
+<input
+id="adminKey"
+type="password"
+placeholder="Enter ADMIN_KEY">
+
+<button onclick="login()">
+Login
+</button>
+
+<p id="loginStatus"></p>
+
+</div>
+
+<div id="panel" class="hidden">
 
 <div class="card">
 
-<b>Whitelist</b>
+<h3>📊 Status</h3>
 
-<p>
-<small>
-Add a WhatsApp number.
-Example: +91 9876543210
-</small>
+<p id="botStatus">
+Loading...
 </p>
 
-<div class="row">
-<input id="number"
-placeholder="+91 9876543210">
-
-<button onclick="addUser()">
-Add
-</button>
-</div>
-
-<p id="status"></p>
-
-</div>
-
-<div class="card">
-
-<b>Allowed users</b>
-
-<ul id="users">
-<li>Loading...</li>
-</ul>
-
-</div>
-
-<div class="card">
-
-<button onclick="loadUsers()">
+<button onclick="refresh()">
 🔄 Refresh
 </button>
 
 <button onclick="location.href='/pair'">
-📱 Pair WhatsApp
+📱 WhatsApp Pairing
 </button>
 
 </div>
 
+<div class="card">
+
+<h3>👥 Whitelist</h3>
+
+<input
+id="number"
+placeholder="+91 9876543210">
+
+<button onclick="addUser()">
+➕ Add user
+</button>
+
+<div id="users">
+Loading...
+</div>
+
+<p id="status" class="status"></p>
+
+</div>
+
+</div>
+
+</main>
+
 <script>
 
-function key(){
-  return localStorage.getItem("adminKey")
-    || prompt("Enter ADMIN_KEY");
-}
+let ADMIN_KEY =
+  localStorage.getItem("adminKey") || "";
 
-async function api(url,opt={}){
-  const k=key();
+function login(){
 
-  if(k)
-    localStorage.setItem("adminKey",k);
+  const value =
+    document.getElementById(
+      "adminKey"
+    ).value.trim();
 
-  opt.headers=Object.assign(
-    {},
-    opt.headers,
-    {"X-Admin-Key":k||""}
+  if(!value){
+    document.getElementById(
+      "loginStatus"
+    ).textContent =
+      "Enter ADMIN_KEY.";
+    return;
+  }
+
+  ADMIN_KEY = value;
+
+  localStorage.setItem(
+    "adminKey",
+    value
   );
 
-  const r=await fetch(url,opt);
-  const d=await r.json();
+  testAuth();
 
-  if(r.status===401)
-    throw Error(
-      "Unauthorized. Check ADMIN_KEY."
-    );
-
-  return d;
 }
 
-async function loadUsers(){
+async function api(
+  url,
+  options={}
+){
+
+  options.headers = {
+    ...(options.headers || {}),
+    "X-Admin-Key": ADMIN_KEY
+  };
+
+  const response =
+    await fetch(
+      url,
+      options
+    );
+
+  const text =
+    await response.text();
+
+  let data;
+
+  try{
+    data = JSON.parse(text);
+  }catch{
+    throw new Error(
+      "Server returned invalid response."
+    );
+  }
+
+  if(
+    response.status === 401
+  ){
+    throw new Error(
+      "Wrong ADMIN_KEY."
+    );
+  }
+
+  if(!response.ok){
+    throw new Error(
+      data.error ||
+      "Request failed."
+    );
+  }
+
+  return data;
+
+}
+
+async function testAuth(){
 
   try{
 
-    const d=await api(
+    await api(
       "/api/whitelist"
     );
 
-    document.getElementById("users")
-      .innerHTML=d.users.length
+    document
+      .getElementById("login")
+      .classList.add("hidden");
 
-      ? d.users.map(
-          u =>
-            "<li>"+
-            u+
-            " <button class='danger' onclick='removeUser("+
-            JSON.stringify(u)+
-            ")'>Remove</button></li>"
-        ).join("")
+    document
+      .getElementById("panel")
+      .classList.remove("hidden");
 
-      : "<li>No allowed users.</li>";
+    refresh();
 
-    document.getElementById("status")
+  }catch(error){
+
+    document
+      .getElementById(
+        "loginStatus"
+      )
       .textContent =
-        "Whitelist mode: "+
-        d.whitelistOnly;
-
-  }catch(e){
-
-    document.getElementById("status")
-      .textContent=e.message;
+      error.message;
 
   }
+
+}
+
+async function refresh(){
+
+  try{
+
+    const data =
+      await api(
+        "/api/whitelist"
+      );
+
+    document
+      .getElementById(
+        "users"
+      )
+      .innerHTML =
+      data.users.length
+      ? data.users.map(
+          user =>
+            '<div class="user">' +
+            user +
+            ' <button class="danger" onclick="removeUser(' +
+            JSON.stringify(user) +
+            ')">Remove</button>' +
+            '</div>'
+        ).join("")
+      : "<p>No users.</p>";
+
+    document
+      .getElementById(
+        "status"
+      )
+      .textContent =
+      "Whitelist mode: " +
+      data.whitelistOnly;
+
+    const health =
+      await fetch(
+        "/health"
+      ).then(
+        r => r.json()
+      );
+
+    document
+      .getElementById(
+        "botStatus"
+      )
+      .textContent =
+      health.connected
+      ? "🟢 WhatsApp connected"
+      : "🟡 WhatsApp not connected";
+
+  }catch(error){
+
+    document
+      .getElementById(
+        "status"
+      )
+      .textContent =
+      error.message;
+
+  }
+
 }
 
 async function addUser(){
 
-  const n=
-    document.getElementById("number")
-      .value;
+  const number =
+    document
+      .getElementById(
+        "number"
+      )
+      .value.trim();
 
-  try{
-
-    const d=await api(
-      "/api/whitelist",
-      {
-        method:"POST",
-
-        headers:{
-          "Content-Type":
-            "application/json"
-        },
-
-        body:
-          JSON.stringify({
-            number:n
-          })
-      }
-    );
-
-    document.getElementById("number")
-      .value="";
-
-    document.getElementById("status")
-      .textContent=d.message;
-
-    loadUsers();
-
-  }catch(e){
-
-    document.getElementById("status")
-      .textContent=e.message;
-
-  }
-}
-
-async function removeUser(n){
-
-  if(!confirm(
-    "Remove "+n+
-    " from whitelist?"
-  ))
+  if(!number){
     return;
+  }
 
   try{
 
-    const d=await api(
-      "/api/whitelist",
-      {
-        method:"DELETE",
+    const data =
+      await api(
+        "/api/whitelist",
+        {
+          method:"POST",
 
-        headers:{
-          "Content-Type":
-            "application/json"
-        },
+          headers:{
+            "Content-Type":
+              "application/json"
+          },
 
-        body:
-          JSON.stringify({
-            number:n
-          })
-      }
-    );
+          body:
+            JSON.stringify({
+              number
+            })
+        }
+      );
 
-    document.getElementById("status")
-      .textContent=d.message;
+    document
+      .getElementById(
+        "number"
+      )
+      .value = "";
 
-    loadUsers();
+    document
+      .getElementById(
+        "status"
+      )
+      .textContent =
+      data.message;
 
-  }catch(e){
+    refresh();
 
-    document.getElementById("status")
-      .textContent=e.message;
+  }catch(error){
+
+    document
+      .getElementById(
+        "status"
+      )
+      .textContent =
+      error.message;
 
   }
+
 }
 
-loadUsers();
+async function removeUser(
+  number
+){
+
+  if(
+    !confirm(
+      "Remove " +
+      number +
+      "?"
+    )
+  ){
+    return;
+  }
+
+  try{
+
+    const data =
+      await api(
+        "/api/whitelist",
+        {
+          method:"DELETE",
+
+          headers:{
+            "Content-Type":
+              "application/json"
+          },
+
+          body:
+            JSON.stringify({
+              number
+            })
+        }
+      );
+
+    document
+      .getElementById(
+        "status"
+      )
+      .textContent =
+      data.message;
+
+    refresh();
+
+  }catch(error){
+
+    document
+      .getElementById(
+        "status"
+      )
+      .textContent =
+      error.message;
+
+  }
+
+}
+
+if(ADMIN_KEY){
+  testAuth();
+}
 
 </script>
 
-</main>
 </body>
+
 </html>`;
 }
 
-
-/* ============================================================
+/* =========================================================
    PAIR PAGE
-============================================================ */
+========================================================= */
 
 function pairHTML() {
 
-  if (botConnected) {
+  if(botConnected){
+
     return `
-<!doctype html>
-<meta name="viewport"
-content="width=device-width">
+    <!doctype html>
+    <meta name="viewport"
+    content="width=device-width">
 
-<div style="
-font-family:Arial;
-text-align:center;
-padding:30px">
+    <div style="font-family:Arial;text-align:center;padding:30px">
 
-<h2>✅ WhatsApp Connected</h2>
+    <h2>✅ WhatsApp Connected</h2>
 
-<p>No QR scan needed.</p>
+    <p>No QR scan required.</p>
 
-</div>`;
+    </div>
+    `;
+
   }
 
-  if (!latestQR) {
+  if(!latestQR){
+
     return `
-<!doctype html>
-<meta name="viewport"
-content="width=device-width">
+    <!doctype html>
 
-<div style="
-font-family:Arial;
-text-align:center;
-padding:30px">
+    <meta name="viewport"
+    content="width=device-width">
 
-<h2>📱 Waiting for QR...</h2>
+    <div style="font-family:Arial;text-align:center;padding:30px">
 
-<p>Auto-refreshing...</p>
+    <h2>📱 Waiting for QR...</h2>
 
-<script>
-setTimeout(
-()=>location.reload(),
-3000
-);
-</script>
+    <p>Refreshing...</p>
 
-</div>`;
+    <script>
+    setTimeout(
+      ()=>location.reload(),
+      3000
+    );
+    </script>
+
+    </div>
+    `;
+
   }
 
   return `
-<!doctype html>
+  <!doctype html>
 
-<html>
+  <html>
 
-<head>
+  <head>
 
-<meta name="viewport"
-content="width=device-width">
+  <meta name="viewport"
+  content="width=device-width">
 
-<meta http-equiv="refresh"
-content="4">
+  <meta http-equiv="refresh"
+  content="4">
 
-<title>
-WhatsApp Pairing
-</title>
+  <title>WhatsApp Pairing</title>
 
-</head>
+  </head>
 
-<body style="
-font-family:Arial;
-text-align:center;
-padding:20px;
-background:#f4f4f4">
+  <body
+  style="font-family:Arial;text-align:center;padding:20px">
 
-<h2>
-📱 Scan with WhatsApp
-</h2>
+  <h2>📱 Scan QR</h2>
 
-<div style="
-background:#fff;
-padding:15px;
-display:inline-block;
-border-radius:15px">
+  <img
+  style="max-width:90%;width:400px"
+  src="/qr.png?t=${Date.now()}">
 
-<img
-style="max-width:90vw;width:400px"
-src="/qr.png?t=${Date.now()}">
+  <p>
+  WhatsApp →
+  Linked devices →
+  Link a device
+  </p>
 
-</div>
+  <p>
+  QR refreshes automatically.
+  </p>
 
-<p>
-WhatsApp → Linked devices →
-Link a device
-</p>
+  </body>
 
-<p>
-QR automatically refreshes.
-</p>
-
-</body>
-</html>`;
+  </html>
+  `;
 }
 
-
-/* ============================================================
+/* =========================================================
    HTTP SERVER
-============================================================ */
+========================================================= */
 
 const server =
   http.createServer(
-    async (req,res) => {
+    async (req,res)=>{
 
-      const url =
-        new URL(
-          req.url,
-          `http://${req.headers.host || "localhost"}`
-        );
+      try{
 
-
-      /* HEALTH */
-
-      if (
-        url.pathname ===
-        "/health"
-      ) {
-        return sendJSON(
-          res,
-          200,
-          {
-            ok:true,
-            connected:
-              botConnected,
-            uptime:
-              process.uptime()
-          }
-        );
-      }
-
-
-      /* ROOT */
-
-      if (
-        url.pathname === "/"
-      ) {
-        return sendJSON(
-          res,
-          200,
-          {
-            ok:true,
-            service:
-              "whatsapp-ai-bot",
-            dashboard:
-              "/dashboard",
-            pair:
-              "/pair"
-          }
-        );
-      }
-
-
-      /* DASHBOARD */
-
-      if (
-        url.pathname ===
-        "/dashboard"
-      ) {
-
-        if (
-          !adminAuthorized(req)
-        ) {
-          return sendJSON(
-            res,
-            401,
-            {
-              error:
-                "Unauthorized"
-            }
+        const url =
+          new URL(
+            req.url,
+            `http://${req.headers.host || "localhost"}`
           );
-        }
 
-        res.writeHead(
-          200,
-          {
-            "Content-Type":
-              "text/html; charset=utf-8"
-          }
-        );
+        /* HEALTH */
 
-        return res.end(
-          dashboardHTML()
-        );
-      }
-
-
-      /* WHITELIST API */
-
-      if (
-        url.pathname ===
-        "/api/whitelist"
-      ) {
-
-        if (
-          !adminAuthorized(req)
-        ) {
-          return sendJSON(
-            res,
-            401,
-            {
-              error:
-                "Unauthorized"
-            }
-          );
-        }
-
-
-        if (
-          req.method === "GET"
-        ) {
-
-          const users =
-            await getWhitelist();
+        if(
+          url.pathname === "/health"
+        ){
 
           return sendJSON(
             res,
             200,
             {
-              users,
-              whitelistOnly:
-                CONFIG.WHITELIST_ONLY
+              ok:true,
+              connected:
+                botConnected,
+              uptime:
+                process.uptime()
             }
           );
+
         }
 
+        /* HOME */
 
-        let body = "";
+        if(
+          url.pathname === "/"
+        ){
 
-        req.on(
-          "data",
-          chunk => {
-            body += chunk;
-          }
-        );
+          return sendJSON(
+            res,
+            200,
+            {
+              ok:true,
+              service:
+                "whatsapp-ai-bot",
+              dashboard:
+                "/dashboard",
+              pair:
+                "/pair"
+            }
+          );
 
-        req.on(
-          "end",
-          async () => {
+        }
 
-            try {
+        /* DASHBOARD
 
-              const data =
-                JSON.parse(
-                  body || "{}"
-                );
+           NO AUTH HERE.
+        */
 
-              const jid =
-                normalizeJid(
-                  data.number
-                );
+        if(
+          url.pathname === "/dashboard"
+        ){
 
-              if (!jid) {
-                return sendJSON(
-                  res,
-                  400,
-                  {
-                    error:
-                      "Enter a valid WhatsApp number."
-                  }
-                );
+          res.writeHead(
+            200,
+            {
+              "Content-Type":
+                "text/html; charset=utf-8",
+              "Cache-Control":
+                "no-store"
+            }
+          );
+
+          return res.end(
+            dashboardHTML()
+          );
+
+        }
+
+        /* PROTECTED WHITELIST API */
+
+        if(
+          url.pathname ===
+          "/api/whitelist"
+        ){
+
+          if(
+            !adminAuthorized(req)
+          ){
+
+            return sendJSON(
+              res,
+              401,
+              {
+                error:
+                  "Unauthorized"
               }
+            );
 
+          }
 
-              if (
-                req.method ===
-                "POST"
-              ) {
+          if(
+            req.method === "GET"
+          ){
 
-                const ok =
+            const users =
+              await getWhitelist();
+
+            return sendJSON(
+              res,
+              200,
+              {
+                users,
+                whitelistOnly:
+                  CONFIG.WHITELIST_ONLY
+              }
+            );
+
+          }
+
+          let body = "";
+
+          req.on(
+            "data",
+            chunk =>
+              body += chunk
+          );
+
+          req.on(
+            "end",
+            async ()=>{
+
+              try{
+
+                const data =
+                  JSON.parse(
+                    body || "{}"
+                  );
+
+                const jid =
+                  normalizeJid(
+                    data.number
+                  );
+
+                if(!jid){
+
+                  return sendJSON(
+                    res,
+                    400,
+                    {
+                      error:
+                        "Enter a valid WhatsApp number."
+                    }
+                  );
+
+                }
+
+                if(
+                  req.method === "POST"
+                ){
+
                   await addWhitelist(
                     jid
                   );
 
-                if (!ok) {
                   return sendJSON(
                     res,
-                    500,
+                    200,
                     {
-                      error:
-                        "Could not add user."
+                      ok:true,
+                      message:
+                        `Added ${jid}`
                     }
                   );
+
                 }
 
-                const users =
-                  await getWhitelist();
+                if(
+                  req.method === "DELETE"
+                ){
 
-                return sendJSON(
-                  res,
-                  200,
-                  {
-                    ok:true,
-                    message:
-                      `Added ${jid}`,
-                    users
-                  }
-                );
-              }
-
-
-              if (
-                req.method ===
-                "DELETE"
-              ) {
-
-                const ok =
                   await removeWhitelist(
                     jid
                   );
 
-                if (!ok) {
                   return sendJSON(
                     res,
-                    500,
+                    200,
                     {
-                      error:
-                        "Could not remove user."
+                      ok:true,
+                      message:
+                        `Removed ${jid}`
                     }
                   );
-                }
 
-                const users =
-                  await getWhitelist();
+                }
 
                 return sendJSON(
                   res,
-                  200,
+                  405,
                   {
-                    ok:true,
-                    message:
-                      `Removed ${jid}`,
-                    users
+                    error:
+                      "Method not allowed"
                   }
                 );
+
+              }catch(error){
+
+                console.error(
+                  error
+                );
+
+                return sendJSON(
+                  res,
+                  500,
+                  {
+                    error:
+                      error.message
+                  }
+                );
+
               }
 
-
-              return sendJSON(
-                res,
-                405,
-                {
-                  error:
-                    "Method not allowed"
-                }
-              );
-
-            } catch {
-
-              return sendJSON(
-                res,
-                400,
-                {
-                  error:
-                    "Invalid JSON."
-                }
-              );
             }
-
-          }
-        );
-
-        return;
-      }
-
-
-      /* PAIR */
-
-      if (
-        url.pathname ===
-        "/pair"
-      ) {
-
-        res.writeHead(
-          200,
-          {
-            "Content-Type":
-              "text/html; charset=utf-8"
-          }
-        );
-
-        return res.end(
-          pairHTML()
-        );
-      }
-
-
-      /* QR */
-
-      if (
-        url.pathname ===
-        "/qr.png"
-      ) {
-
-        if (!latestQR) {
-          res.writeHead(404);
-          return res.end(
-            "QR not ready"
           );
+
+          return;
+
         }
 
-        try {
+        /* PAIR */
+
+        if(
+          url.pathname === "/pair"
+        ){
+
+          res.writeHead(
+            200,
+            {
+              "Content-Type":
+                "text/html; charset=utf-8"
+            }
+          );
+
+          return res.end(
+            pairHTML()
+          );
+
+        }
+
+        /* QR */
+
+        if(
+          url.pathname === "/qr.png"
+        ){
+
+          if(!latestQR){
+
+            res.writeHead(
+              404
+            );
+
+            return res.end(
+              "QR not ready"
+            );
+
+          }
 
           const png =
             await QRCode.toBuffer(
@@ -1271,7 +1294,6 @@ const server =
             {
               "Content-Type":
                 "image/png",
-
               "Cache-Control":
                 "no-store"
             }
@@ -1281,45 +1303,60 @@ const server =
             png
           );
 
-        } catch {
-
-          res.writeHead(500);
-
-          return res.end(
-            "QR error"
-          );
         }
+
+        res.writeHead(
+          404
+        );
+
+        res.end(
+          "Not found"
+        );
+
+      }catch(error){
+
+        console.error(
+          "HTTP error:",
+          error
+        );
+
+        if(!res.headersSent){
+
+          sendJSON(
+            res,
+            500,
+            {
+              error:
+                "Internal server error"
+            }
+          );
+
+        }
+
       }
-
-
-      res.writeHead(404);
-
-      res.end(
-        "Not found"
-      );
 
     }
   );
 
+/* =========================================================
+   START HTTP SERVER
+========================================================= */
 
 server.listen(
   CONFIG.PORT,
   "0.0.0.0",
-  () => {
-
+  ()=>{
     console.log(
       `🌐 HTTP server listening on ${CONFIG.PORT}`
     );
-
   }
 );
 
+/* =========================================================
+   WHATSAPP
+========================================================= */
 
-/* ============================================================
-   START WHATSAPP
-============================================================ */
-
-async function startBot() {
+async function startBot(){
 
   const {
     state,
@@ -1329,7 +1366,6 @@ async function startBot() {
       CONFIG.SESSION_DIR
     );
 
-
   sock =
     makeWASocket({
       auth:state,
@@ -1337,7 +1373,7 @@ async function startBot() {
       logger,
 
       browser:[
-        "Online AI Bot",
+        "Ayush AI",
         "Chrome",
         "1.0.0"
       ],
@@ -1345,12 +1381,10 @@ async function startBot() {
       syncFullHistory:false
     });
 
-
   sock.ev.on(
     "creds.update",
     saveCreds
   );
-
 
   sock.ev.on(
     "connection.update",
@@ -1358,362 +1392,342 @@ async function startBot() {
       connection,
       lastDisconnect,
       qr
-    }) => {
+    })=>{
 
-      if (qr) {
+      if(qr){
 
-        latestQR=qr;
-        botConnected=false;
+        latestQR =
+          qr;
+
+        botConnected =
+          false;
 
         console.log(
-          "📱 New QR generated"
+          "📱 New WhatsApp QR generated"
         );
+
       }
 
+      if(
+        connection === "open"
+      ){
 
-      if (
-        connection ===
-        "open"
-      ) {
+        botConnected =
+          true;
 
-        botConnected=true;
-        latestQR=null;
+        latestQR =
+          null;
 
         console.log(
           "✅ WhatsApp connected"
         );
 
-        await logEvent(
-          "info",
-          "whatsapp_connected"
-        );
       }
 
+      if(
+        connection === "close"
+      ){
 
-      if (
-        connection ===
-        "close"
-      ) {
-
-        botConnected=false;
+        botConnected =
+          false;
 
         const code =
           new Boom(
             lastDisconnect?.error
           )
-            ?.output
-            ?.statusCode;
+          ?.output
+          ?.statusCode;
 
-
-        await logEvent(
-          "warn",
-          "whatsapp_disconnected",
-          null,
-          {
-            code
-          }
+        console.error(
+          "WhatsApp connection closed:",
+          code
         );
 
-
-        if (
+        if(
           code !==
             DisconnectReason.loggedOut &&
           !reconnecting
-        ) {
+        ){
 
-          reconnecting=true;
+          reconnecting =
+            true;
 
           setTimeout(
-            () => {
-
-              reconnecting=false;
+            ()=>{
+              reconnecting =
+                false;
 
               startBot()
                 .catch(
                   console.error
                 );
-
             },
             3000
           );
+
         }
+
       }
 
     }
   );
 
-
-  /* ==========================================================
-     MESSAGES
-  ========================================================== */
-
   sock.ev.on(
     "messages.upsert",
     async ({
       messages
-    }) => {
+    })=>{
 
-      try {
+      try{
 
         const msg =
           messages?.[0];
 
-        if (
+        if(
           !msg ||
           msg.key.fromMe
-        ) {
+        ){
           return;
         }
-
 
         const jid =
           msg.key.remoteJid;
 
-
-        if (
+        if(
           !jid ||
-          jid.endsWith("@g.us")
-        ) {
+          jid.endsWith(
+            "@g.us"
+          )
+        ){
           return;
         }
-
 
         const text =
           (
-            msg.message
-              ?.conversation ||
-
-            msg.message
-              ?.extendedTextMessage
-              ?.text ||
-
+            msg.message?.conversation ||
+            msg.message?.extendedTextMessage?.text ||
             ""
           ).trim();
 
-
-        if (!text) {
+        if(!text){
           return;
         }
 
+        console.log(
+          `📩 ${jid}: ${text}`
+        );
+
+        await logMessage(
+          jid,
+          "incoming",
+          text
+        );
 
         /* START */
 
-        if (
+        if(
           /^start$/i.test(
             text
           )
-        ) {
+        ){
 
           await addWhitelist(
             jid
           );
 
+          const reply =
+            "✅ You are opted in again.";
+
           await sock.sendMessage(
             jid,
             {
-              text:
-                "✅ You are opted in again."
+              text:reply
             }
           );
 
-          return;
-        }
+          await logMessage(
+            jid,
+            "outgoing",
+            reply
+          );
 
+          return;
+
+        }
 
         /* STOP */
 
-        if (
+        if(
           /^stop$/i.test(
             text
           )
-        ) {
+        ){
 
           await removeWhitelist(
             jid
           );
 
-          await sock.sendMessage(
-            jid,
-            {
-              text:
-                "🛑 Opt-out received. You will no longer receive bot replies."
-            }
-          );
-
-          return;
-        }
-
-
-        /* CHECK ACCESS */
-
-        if (
-          !(await isAllowed(jid))
-        ) {
-
-          console.log(
-            `🚫 Whitelist blocked: ${jid}`
-          );
-
-          return;
-        }
-
-
-        /* CLEAR */
-
-        if (
-          /^\/clear$/i.test(
-            text
-          )
-        ) {
-
-          await clearConversation(
-            jid
-          );
+          const reply =
+            "🛑 You have been opted out. Send START to enable the bot again.";
 
           await sock.sendMessage(
             jid,
             {
-              text:
-                "🧹 Conversation history cleared."
+              text:reply
             }
           );
 
-          return;
-        }
+          await logMessage(
+            jid,
+            "outgoing",
+            reply
+          );
 
+          return;
+
+        }
 
         /* HELP */
 
-        if (
-          /^\/help$/i.test(
+        if(
+          /^help$/i.test(
             text
           )
-        ) {
+        ){
 
-          await sock.sendMessage(
-            jid,
-            {
-              text:
+          const reply =
 `🤖 ${CONFIG.AI_NAME}
 
 Commands:
 
-/help
-/clear
-/start
-/stop
+/start or START
+Enable the bot.
 
-Send any normal message to chat with the AI.`
+STOP
+Disable the bot.
+
+HELP
+Show this help.
+
+CLEAR
+Clear your AI memory.`;
+
+          await sock.sendMessage(
+            jid,
+            {
+              text:reply
             }
           );
 
+          await logMessage(
+            jid,
+            "outgoing",
+            reply
+          );
+
           return;
+
         }
 
+        /* WHITELIST */
 
-        /* SAVE USER MESSAGE */
+        if(
+          !(await isAllowed(jid))
+        ){
 
-        await saveMessage(
-          jid,
-          "user",
-          text
-        );
+          console.log(
+            `🚫 Blocked: ${jid}`
+          );
 
+          return;
 
-        /* TYPING */
+        }
 
-        try {
-          await sock.sendPresenceUpdate(
-            "composing",
+        /* CLEAR */
+
+        if(
+          /^clear$/i.test(
+            text
+          )
+        ){
+
+          await clearHistory(
             jid
           );
-        } catch {}
 
+          const reply =
+            "🧹 Your AI memory has been cleared.";
+
+          await sock.sendMessage(
+            jid,
+            {
+              text:reply
+            }
+          );
+
+          await logMessage(
+            jid,
+            "outgoing",
+            reply
+          );
+
+          return;
+
+        }
 
         /* AI */
 
-        let result;
+        try{
 
-        try {
-
-          result =
+          const reply =
             await askAI(
               jid,
               text
             );
 
-        } catch (error) {
+          await sock.sendMessage(
+            jid,
+            {
+              text:reply
+            }
+          );
+
+          await logMessage(
+            jid,
+            "outgoing",
+            reply
+          );
+
+          console.log(
+            `🤖 ${jid}: ${reply}`
+          );
+
+        }catch(error){
 
           console.error(
             "AI error:",
             error
           );
 
-          await logEvent(
-            "error",
-            "ai_request_failed",
-            jid,
-            {
-              message:
-                error.message
-            }
-          );
+          const reply =
+            "⚠️ AI is temporarily unavailable. Please try again.";
 
           await sock.sendMessage(
             jid,
             {
-              text:
-                "⚠️ Sorry, the AI is temporarily unavailable. Please try again."
+              text:reply
             }
           );
 
-          return;
+          await logMessage(
+            jid,
+            "outgoing",
+            reply
+          );
+
         }
 
-
-        /* SAVE AI RESPONSE */
-
-        await saveMessage(
-          jid,
-          "assistant",
-          result.text
-        );
-
-
-        /* STOP TYPING */
-
-        try {
-          await sock.sendPresenceUpdate(
-            "paused",
-            jid
-          );
-        } catch {}
-
-
-        /* SEND */
-
-        await sock.sendMessage(
-          jid,
-          {
-            text:
-              result.text
-          }
-        );
-
-
-        await logEvent(
-          "info",
-          "ai_message",
-          jid,
-          {
-            model:
-              result.model,
-            usage:
-              result.usage
-          }
-        );
-
-      } catch (error) {
+      }catch(error){
 
         console.error(
           "Message handler error:",
@@ -1724,17 +1738,21 @@ Send any normal message to chat with the AI.`
 
     }
   );
+
 }
 
+/* =========================================================
+   START
+========================================================= */
 
 startBot()
-  .catch(error => {
+  .catch(
+    error=>{
+      console.error(
+        "Fatal WhatsApp error:",
+        error
+      );
 
-    console.error(
-      "Fatal:",
-      error
-    );
-
-    process.exit(1);
-
-  });
+      process.exit(1);
+    }
+  );
