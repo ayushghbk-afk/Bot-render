@@ -484,7 +484,7 @@ async function askAI(jid, text, imageContext = null) {
         ...history,
         {
           role: "user",
-          content: `[Image Summary]: ${imageContext}\n\n[User Message]: ${text}`
+          content: `[Image Summary]: ${imageContext}\n\n[User Message]: ${text || "Tell me about this image"}`
         }
       ];
     } else {
@@ -559,7 +559,7 @@ async function askAI(jid, text, imageContext = null) {
         throw new Error("AI returned an empty response");
       }
       
-      await saveHistory(jid, "user", text);
+      await saveHistory(jid, "user", text || "Image sent");
       await saveHistory(jid, "assistant", answer);
       
       return answer;
