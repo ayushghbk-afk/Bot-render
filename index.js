@@ -14,8 +14,8 @@ const fs = require("fs");
 const http = require("http");
 const path = require("path");
 const crypto = require("crypto");
-const FormData = require("form-data");
 const axios = require("axios");
+const FormData = require("form-data");
 
 const logger = pino({ level: "silent" });
 
@@ -36,9 +36,9 @@ const CONFIG = {
   MAX_HISTORY: Number(process.env.MAX_HISTORY || 10),
   TEMP_DIR: process.env.TEMP_DIR || "./temp",
   MAX_IMAGE_SIZE: Number(process.env.MAX_IMAGE_SIZE || 10 * 1024 * 1024),
-  // Image analysis API key (get free from https://www.sightengine.com/ or https://imagga.com/)
-  IMAGE_API_KEY: process.env.IMAGE_API_KEY || "",
-  IMAGE_API_SECRET: process.env.IMAGE_API_SECRET || "",
+  // Sightengine API credentials
+  SIGHTENGINE_API_USER: process.env.SIGHTENGINE_API_USER || "176955014",
+  SIGHTENGINE_API_SECRET: process.env.SIGHTENGINE_API_SECRET || "mDMvVABiFWwJdcT9UrFrR4wniW3N3SH3",
 };
 
 /* =========================================================
@@ -156,7 +156,7 @@ function cleanupTempFile(filePath) {
 }
 
 /* =========================================================
-   IMAGE PROCESSING
+   IMAGE PROCESSING WITH SIGHTENGINE
 ========================================================= */
 
 async function downloadAndProcessImage(message) {
@@ -212,128 +212,129 @@ async function downloadAndProcessImage(message) {
   }
 }
 
-async function analyzeImageWithFreeAPI(imageBuffer, mimetype) {
+async function analyzeImageWithSightengine(imageBuffer, mimetype) {
   try {
-    // Try multiple free image analysis services
-    const results = [];
+    const form = new FormData();
     
-    // Method 1: Try Sightengine API (free tier available)
-    if (CONFIG.IMAGE_API_KEY && CONFIG.IMAGE_API_SECRET) {
-      try {
-        const form = new FormData();
-        form.append("media", imageBuffer, {
-          filename: `image.${mimetype.split("/")[1] || "jpg"}`,
-          contentType: mimetype
-        });
-        form.append("models", "genai,faces,scam,text");
-        form.append("api_user", CONFIG.IMAGE_API_KEY);
-        form.append("api_secret", CONFIG.IMAGE_API_SECRET);
+    // Append the image buffer
+    form.append("media", imageBuffer, {
+      filename: `image.${mimetype.split("/")[1] || "jpg"}`,
+      contentType: mimetype
+    });
+    
+    // Request multiple analysis models
+    form.append("models", "genai,text,faces,scam,offensive,gore,violence,weapon,alcohol,drugs");
+    form.append("api_user", CONFIG.SIGHTENGINE_API_USER);
+    form.append("api_secret", CONFIG.SIGHTENGINE_API_SECRET);
 
-        const response = await axios.post("https://api.sightengine.com/1.0/check.json", form, {
-          headers: form.getHeaders()
-        });
+    const response = await axios({
+      method: "post",
+      url: "https://api.sightengine.com/1.0/check.json",
+      data: form,
+      headers: form.getHeaders()
+    });
 
-        if (response.data) {
-          const data = response.data;
-          let description = [];
-          
-          // Add text detection
-          if (data.text?.text) {
-            description.push(`Text in image: ${data.text.text}`);
-          }
-          
-          // Add general description
-          if (data.genai?.description) {
-            description.push(`Description: ${data.genai.description}`);
-          }
-          
-          results.push(description.join("\n"));
-        }
-      } catch (error) {
-        console.error("Sightengine error:", error.message);
-      }
+    if (response.data) {
+      return formatSightengineResponse(response.data);
     }
     
-    // Method 2: Try Imagga API (free tier available)
-    if (CONFIG.IMAGE_API_KEY && CONFIG.IMAGE_API_SECRET) {
-      try {
-        const response = await axios.post(
-          "https://api.imagga.com/v2/tags",
-          {
-            image_base64: imageBuffer.toString("base64")
-          },
-          {
-            auth: {
-              username: CONFIG.IMAGE_API_KEY,
-              password: CONFIG.IMAGE_API_SECRET
-            }
-          }
-        );
-
-        if (response.data?.result?.tags) {
-          const tags = response.data.result.tags
-            .filter(tag => tag.confidence > 50)
-            .map(tag => tag.tag.en)
-            .slice(0, 20);
-          
-          if (tags.length > 0) {
-            results.push(`Objects/Elements detected: ${tags.join(", ")}`);
-          }
-        }
-      } catch (error) {
-        console.error("Imagga error:", error.message);
-      }
-    }
-    
-    // Method 3: Use free OCR API
-    try {
-      const response = await axios.post("https://api.ocr.space/parse/image", {
-        base64Image: `data:${mimetype};base64,${imageBuffer.toString("base64")}`,
-        language: "eng",
-        isOverlayRequired: false
-      }, {
-        headers: {
-          "apikey": "helloworld" // Free API key for testing
-        }
-      });
-
-      if (response.data?.ParsedResults?.[0]?.ParsedText) {
-        const text = response.data.ParsedResults[0].ParsedText.trim();
-        if (text) {
-          results.push(`Text found in image: ${text}`);
-        }
-      }
-    } catch (error) {
-      console.error("OCR error:", error.message);
-    }
-    
-    // Method 4: Try to use AI to describe image based on basic features
-    const aiDescription = await askAIToDescribeImage(imageBuffer, mimetype);
-    if (aiDescription) {
-      results.push(aiDescription);
-    }
-    
-    if (results.length === 0) {
-      return null;
-    }
-    
-    return results.join("\n\n");
+    return null;
   } catch (error) {
-    console.error("Image analysis error:", error);
+    console.error("Sightengine analysis error:", error.message);
+    if (error.response) {
+      console.error("Response data:", error.response.data);
+    }
     return null;
   }
 }
 
-async function askAIToDescribeImage(imageBuffer, mimetype) {
+function formatSightengineResponse(data) {
   try {
-    // Extract basic image info
-    const dimensions = getImageDimensions(imageBuffer);
-    const fileSize = imageBuffer.length;
+    const parts = [];
     
-    // Try to detect colors (simplified)
-    const colorInfo = analyzeColors(imageBuffer);
+    // AI-generated description
+    if (data.genai?.description) {
+      parts.push(`📝 **Description:**\n${data.genai.description}`);
+    }
     
-    // Create a prompt for the AI to imagine/describe the image
+    // Text detected in image
+    if (data.text?.text) {
+      parts.push(`🔤 **Text in image:**\n${data.text.text}`);
+    }
+    
+    // Faces detected
+    if (data.faces && data.faces.length > 0) {
+      const faceCount = data.faces.length;
+      parts.push(`👤 **Faces detected:** ${faceCount}`);
+      
+      // Add details about faces
+      data.faces.forEach((face, index) => {
+        if (face.attributes) {
+          const attrs = face.attributes;
+          const details = [];
+          
+          if (attrs.age && attrs.age.min && attrs.age.max) {
+            details.push(`Age: ${attrs.age.min}-${attrs.age.max}`);
+          }
+          if (attrs.gender && attrs.gender.label) {
+            details.push(`Gender: ${attrs.gender.label}`);
+          }
+          if (attrs.emotion && attrs.emotion.dominant) {
+            details.push(`Emotion: ${attrs.emotion.dominant}`);
+          }
+          
+          if (details.length > 0) {
+            parts.push(`Face ${index + 1}: ${details.join(", ")}`);
+          }
+        }
+      });
+    }
+    
+    // Content moderation results
+    const moderationResults = [];
+    
+    if (data.weapon?.classes?.firearm > 0.5) {
+      moderationResults.push("Contains weapons");
+    }
+    if (data.alcohol?.prob > 0.5) {
+      moderationResults.push("Contains alcohol");
+    }
+    if (data.drugs?.prob > 0.5) {
+      moderationResults.push("Contains drugs");
+    }
+    if (data.offensive?.prob > 0.5) {
+      moderationResults.push("Contains offensive content");
+    }
+    if (data.gore?.prob > 0.5) {
+      moderationResults.push("Contains gore/violence");
+    }
+    if (data.violence?.prob > 0.5) {
+      moderationResults.push("Contains violence");
+    }
+    
+    if (moderationResults.length > 0) {
+      parts.push(`⚠️ **Content warnings:**\n${moderationResults.join(", ")}`);
+    }
+    
+    // Scam detection
+    if (data.scam?.prob > 0.5) {
+      parts.push(`🚫 **Scam detection:** High probability of scam content`);
+    }
+    
+    // If we have no detailed analysis, provide basic info
+    if (parts.length === 0) {
+      parts.push("📷 **Image Analysis:**\nThe image was analyzed but no significant elements were detected.");
+    }
+    
+    return parts.join("\n\n");
+  } catch (error) {
+    console.error("Error formatting Sightengine response:", error);
+    return "Unable to analyze image properly.";
+  }
+}
+
+async function askAIToDescribeImage(imageBuffer, mimetype, sightengineAnalysis) {
+  try {
     const response = await fetch(CONFIG.AI_PROXY_URL, {
       method: "POST",
       headers: {
@@ -341,17 +342,11 @@ async function askAIToDescribeImage(imageBuffer, mimetype) {
       },
       body: JSON.stringify({
         model: CONFIG.AI_MODEL,
-        instructions: `You are an AI assistant that can analyze images based on metadata. Based on the following image properties, provide a detailed description of what this image likely contains. Be creative but realistic.`,
+        instructions: `You are ${CONFIG.AI_NAME}, a helpful WhatsApp AI assistant. Based on the image analysis provided, create a natural, conversational description of the image for the user.`,
         input: [
           {
             role: "user",
-            content: `Image properties:
-- Format: ${mimetype}
-- Size: ${(fileSize / 1024).toFixed(2)} KB
-- Dimensions: ${dimensions ? `${dimensions.width}x${dimensions.height}` : "Unknown"}
-- Color info: ${colorInfo}
-
-Based on these properties, describe what this image likely shows. Consider that it could be a screenshot, photo, meme, or any common image type. Provide a detailed analysis.`
+            content: `Here's the technical analysis of an image:\n\n${sightengineAnalysis}\n\nPlease provide a natural, friendly description of what this image contains.`
           }
         ],
         max_output_tokens: 500,
@@ -365,7 +360,7 @@ Based on these properties, describe what this image likely shows. Consider that 
     try {
       data = JSON.parse(raw);
     } catch {
-      return null;
+      return sightengineAnalysis;
     }
 
     let answer = data?.output_text || data?.choices?.[0]?.message?.content || "";
@@ -382,68 +377,10 @@ Based on these properties, describe what this image likely shows. Consider that 
       }
     }
 
-    return answer.trim() || null;
+    return answer.trim() || sightengineAnalysis;
   } catch (error) {
-    console.error("AI image description error:", error);
-    return null;
-  }
-}
-
-function getImageDimensions(buffer) {
-  try {
-    if (buffer.length < 24) return null;
-    
-    // JPEG
-    if (buffer[0] === 0xFF && buffer[1] === 0xD8) {
-      let offset = 2;
-      while (offset < buffer.length) {
-        if (buffer[offset] !== 0xFF) break;
-        const marker = buffer[offset + 1];
-        if (marker === 0xC0 || marker === 0xC1 || marker === 0xC2) {
-          const height = buffer.readUInt16BE(offset + 5);
-          const width = buffer.readUInt16BE(offset + 7);
-          return { width, height };
-        }
-        const length = buffer.readUInt16BE(offset + 2);
-        offset += 2 + length;
-      }
-    }
-    
-    // PNG
-    if (buffer[0] === 0x89 && buffer[1] === 0x50) {
-      const width = buffer.readUInt32BE(16);
-      const height = buffer.readUInt32BE(20);
-      return { width, height };
-    }
-    
-    // GIF
-    if (buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46) {
-      const width = buffer.readUInt16LE(6);
-      const height = buffer.readUInt16LE(8);
-      return { width, height };
-    }
-    
-    return null;
-  } catch (error) {
-    return null;
-  }
-}
-
-function analyzeColors(buffer) {
-  try {
-    // Simple color analysis (sampling some pixels)
-    const colors = [];
-    const sampleSize = Math.min(buffer.length, 10000);
-    
-    for (let i = 0; i < sampleSize; i += 100) {
-      if (i + 2 < buffer.length) {
-        colors.push(`rgb(${buffer[i]},${buffer[i+1]},${buffer[i+2]})`);
-      }
-    }
-    
-    return colors.length > 0 ? colors.join(", ") : "Unknown";
-  } catch (error) {
-    return "Unknown";
+    console.error("AI description error:", error);
+    return sightengineAnalysis;
   }
 }
 
@@ -1207,27 +1144,30 @@ async function startBot() {
             const imageData = await downloadAndProcessImage(msg);
             
             if (imageData) {
-              const imageAnalysis = await analyzeImageWithFreeAPI(imageData.buffer, imageData.mimetype);
+              // Analyze with Sightengine
+              const sightengineAnalysis = await analyzeImageWithSightengine(imageData.buffer, imageData.mimetype);
               
               cleanupTempFile(imageData.tempFilePath);
               
               let finalResponse;
               
-              if (imageAnalysis) {
-                if (text) {
-                  finalResponse = await askAI(jid, text, imageAnalysis);
-                } else {
-                  finalResponse = `📸 **Image Analysis:**\n\n${imageAnalysis}`;
-                }
-              } else {
-                // Fallback to AI-based description
-                const aiDescription = await askAIToDescribeImage(imageData.buffer, imageData.mimetype);
+              if (sightengineAnalysis) {
+                // Get AI to create natural description
+                const aiDescription = await askAIToDescribeImage(
+                  imageData.buffer,
+                  imageData.mimetype,
+                  sightengineAnalysis
+                );
                 
                 if (text) {
-                  finalResponse = await askAI(jid, text, aiDescription);
+                  // If user asked a question about the image
+                  finalResponse = await askAI(jid, text, sightengineAnalysis);
                 } else {
+                  // Just send the analysis
                   finalResponse = `📸 **Image Analysis:**\n\n${aiDescription}`;
                 }
+              } else {
+                finalResponse = "⚠️ Sorry, I couldn't analyze this image. Please try another image.";
               }
               
               await sock.sendMessage(jid, { text: finalResponse });
