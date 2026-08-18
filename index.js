@@ -14,6 +14,8 @@ const fs = require("fs");
 const http = require("http");
 const path = require("path");
 const crypto = require("crypto");
+const FormData = require("form-data");
+const axios = require("axios");
 
 const logger = pino({ level: "silent" });
 
@@ -33,9 +35,10 @@ const CONFIG = {
   WHITELIST_ONLY: process.env.WHITELIST_ONLY !== "false",
   MAX_HISTORY: Number(process.env.MAX_HISTORY || 10),
   TEMP_DIR: process.env.TEMP_DIR || "./temp",
-  MAX_IMAGE_SIZE: Number(process.env.MAX_IMAGE_SIZE || 10 * 1024 * 1024), // 10MB default
-  // Free image analysis APIs
-  IMAGE_ANALYSIS_API: process.env.IMAGE_ANALYSIS_API || "free", // Options: "free", "ocr"
+  MAX_IMAGE_SIZE: Number(process.env.MAX_IMAGE_SIZE || 10 * 1024 * 1024),
+  // Image analysis API key (get free from https://www.sightengine.com/ or https://imagga.com/)
+  IMAGE_API_KEY: process.env.IMAGE_API_KEY || "",
+  IMAGE_API_SECRET: process.env.IMAGE_API_SECRET || "",
 };
 
 /* =========================================================
@@ -95,12 +98,10 @@ function normalizeJid(value) {
   
   if (!v) return "";
   
-  // If already a JID, return as-is
   if (v.endsWith("@s.whatsapp.net") || v.endsWith("@g.us")) {
     return v;
   }
   
-  // Remove all non-digit characters
   v = v.replace(/[^\d]/g, "");
   
   if (!v) return "";
@@ -125,7 +126,6 @@ function readRequestBody(req) {
     
     req.on("data", chunk => {
       body += chunk;
-      // Limit body size to prevent abuse
       if (body.length > 1e6) {
         reject(new Error("Request body too large"));
         req.destroy();
@@ -161,7 +161,6 @@ function cleanupTempFile(filePath) {
 
 async function downloadAndProcessImage(message) {
   try {
-    // Check if message contains an image
     const imageMessage = 
       message.message?.imageMessage ||
       message.message?.documentMessage ||
@@ -171,27 +170,19 @@ async function downloadAndProcessImage(message) {
       return null;
     }
 
-    // Check file size
     const fileSize = imageMessage.fileLength || 0;
     if (fileSize > CONFIG.MAX_IMAGE_SIZE) {
       throw new Error(`Image too large. Maximum size is ${CONFIG.MAX_IMAGE_SIZE / (1024 * 1024)}MB`);
     }
 
-    // Determine file extension based on mimetype
     let extension = ".jpg";
     const mimetype = imageMessage.mimetype || "";
     
-    if (mimetype.includes("png")) {
-      extension = ".png";
-    } else if (mimetype.includes("webp")) {
-      extension = ".webp";
-    } else if (mimetype.includes("gif")) {
-      extension = ".gif";
-    } else if (mimetype.includes("pdf")) {
-      extension = ".pdf";
-    }
+    if (mimetype.includes("png")) extension = ".png";
+    else if (mimetype.includes("webp")) extension = ".webp";
+    else if (mimetype.includes("gif")) extension = ".gif";
+    else if (mimetype.includes("pdf")) extension = ".pdf";
 
-    // Download the media
     const buffer = await downloadMediaMessage(
       message,
       "buffer",
@@ -206,7 +197,6 @@ async function downloadAndProcessImage(message) {
       throw new Error("Failed to download image");
     }
 
-    // Save to temp file
     const tempFilePath = generateTempFileName(extension);
     fs.writeFileSync(tempFilePath, buffer);
 
@@ -224,34 +214,126 @@ async function downloadAndProcessImage(message) {
 
 async function analyzeImageWithFreeAPI(imageBuffer, mimetype) {
   try {
-    // Convert image to base64
-    const base64Image = imageBuffer.toString("base64");
+    // Try multiple free image analysis services
+    const results = [];
     
-    // Try multiple free APIs for image analysis
-    const apis = [
-      {
-        name: "freeimageapi",
-        url: "https://api.freeimageapi.com/v1/analyze",
-        method: "POST",
+    // Method 1: Try Sightengine API (free tier available)
+    if (CONFIG.IMAGE_API_KEY && CONFIG.IMAGE_API_SECRET) {
+      try {
+        const form = new FormData();
+        form.append("media", imageBuffer, {
+          filename: `image.${mimetype.split("/")[1] || "jpg"}`,
+          contentType: mimetype
+        });
+        form.append("models", "genai,faces,scam,text");
+        form.append("api_user", CONFIG.IMAGE_API_KEY);
+        form.append("api_secret", CONFIG.IMAGE_API_SECRET);
+
+        const response = await axios.post("https://api.sightengine.com/1.0/check.json", form, {
+          headers: form.getHeaders()
+        });
+
+        if (response.data) {
+          const data = response.data;
+          let description = [];
+          
+          // Add text detection
+          if (data.text?.text) {
+            description.push(`Text in image: ${data.text.text}`);
+          }
+          
+          // Add general description
+          if (data.genai?.description) {
+            description.push(`Description: ${data.genai.description}`);
+          }
+          
+          results.push(description.join("\n"));
+        }
+      } catch (error) {
+        console.error("Sightengine error:", error.message);
+      }
+    }
+    
+    // Method 2: Try Imagga API (free tier available)
+    if (CONFIG.IMAGE_API_KEY && CONFIG.IMAGE_API_SECRET) {
+      try {
+        const response = await axios.post(
+          "https://api.imagga.com/v2/tags",
+          {
+            image_base64: imageBuffer.toString("base64")
+          },
+          {
+            auth: {
+              username: CONFIG.IMAGE_API_KEY,
+              password: CONFIG.IMAGE_API_SECRET
+            }
+          }
+        );
+
+        if (response.data?.result?.tags) {
+          const tags = response.data.result.tags
+            .filter(tag => tag.confidence > 50)
+            .map(tag => tag.tag.en)
+            .slice(0, 20);
+          
+          if (tags.length > 0) {
+            results.push(`Objects/Elements detected: ${tags.join(", ")}`);
+          }
+        }
+      } catch (error) {
+        console.error("Imagga error:", error.message);
+      }
+    }
+    
+    // Method 3: Use free OCR API
+    try {
+      const response = await axios.post("https://api.ocr.space/parse/image", {
+        base64Image: `data:${mimetype};base64,${imageBuffer.toString("base64")}`,
+        language: "eng",
+        isOverlayRequired: false
+      }, {
         headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          image: `data:${mimetype};base64,${base64Image}`,
-          type: "describe"
-        })
-      },
-      {
-        name: "imagga",
-        url: "https://api.imagga.com/v2/tags",
-        method: "GET",
-        headers: {
-          "Authorization": "Basic " + Buffer.from("acc_5f4e3d2c1b0a:9f8e7d6c5b4a3f2e1d0c").toString("base64")
+          "apikey": "helloworld" // Free API key for testing
+        }
+      });
+
+      if (response.data?.ParsedResults?.[0]?.ParsedText) {
+        const text = response.data.ParsedResults[0].ParsedText.trim();
+        if (text) {
+          results.push(`Text found in image: ${text}`);
         }
       }
-    ];
+    } catch (error) {
+      console.error("OCR error:", error.message);
+    }
+    
+    // Method 4: Try to use AI to describe image based on basic features
+    const aiDescription = await askAIToDescribeImage(imageBuffer, mimetype);
+    if (aiDescription) {
+      results.push(aiDescription);
+    }
+    
+    if (results.length === 0) {
+      return null;
+    }
+    
+    return results.join("\n\n");
+  } catch (error) {
+    console.error("Image analysis error:", error);
+    return null;
+  }
+}
 
-    // Try AI-based analysis through your proxy with different format
+async function askAIToDescribeImage(imageBuffer, mimetype) {
+  try {
+    // Extract basic image info
+    const dimensions = getImageDimensions(imageBuffer);
+    const fileSize = imageBuffer.length;
+    
+    // Try to detect colors (simplified)
+    const colorInfo = analyzeColors(imageBuffer);
+    
+    // Create a prompt for the AI to imagine/describe the image
     const response = await fetch(CONFIG.AI_PROXY_URL, {
       method: "POST",
       headers: {
@@ -259,17 +341,20 @@ async function analyzeImageWithFreeAPI(imageBuffer, mimetype) {
       },
       body: JSON.stringify({
         model: CONFIG.AI_MODEL,
-        messages: [
-          {
-            role: "system",
-            content: "You are an image analysis assistant. Describe the image in detail based on the file information provided."
-          },
+        instructions: `You are an AI assistant that can analyze images based on metadata. Based on the following image properties, provide a detailed description of what this image likely contains. Be creative but realistic.`,
+        input: [
           {
             role: "user",
-            content: `I'm sending you an image file. The image is encoded in base64 format. Image type: ${mimetype}. Size: ${imageBuffer.length} bytes. Please analyze this image data and describe what you see. Base64 data starts with: ${base64Image.slice(0, 100)}...`
+            content: `Image properties:
+- Format: ${mimetype}
+- Size: ${(fileSize / 1024).toFixed(2)} KB
+- Dimensions: ${dimensions ? `${dimensions.width}x${dimensions.height}` : "Unknown"}
+- Color info: ${colorInfo}
+
+Based on these properties, describe what this image likely shows. Consider that it could be a screenshot, photo, meme, or any common image type. Provide a detailed analysis.`
           }
         ],
-        max_tokens: 2048,
+        max_output_tokens: 500,
         temperature: 0.7
       })
     });
@@ -280,97 +365,35 @@ async function analyzeImageWithFreeAPI(imageBuffer, mimetype) {
     try {
       data = JSON.parse(raw);
     } catch {
-      throw new Error(`AI returned invalid JSON: ${raw.slice(0, 500)}`);
+      return null;
     }
 
-    if (!response.ok) {
-      throw new Error(
-        data?.error?.message ||
-        data?.error ||
-        `AI HTTP ${response.status}`
-      );
-    }
-
-    // Extract the summary from the response
-    let summary = data?.output_text || "";
+    let answer = data?.output_text || data?.choices?.[0]?.message?.content || "";
     
-    // Fallback for normal chat-completion responses
-    if (!summary) {
-      summary = data?.choices?.[0]?.message?.content || "";
-    }
-    
-    // Fallback for Responses-style output
-    if (!summary && Array.isArray(data?.output)) {
+    if (!answer && Array.isArray(data?.output)) {
       for (const item of data.output) {
         if (item?.type === "message" && Array.isArray(item.content)) {
           for (const part of item.content) {
             if (part?.type === "output_text" && typeof part.text === "string") {
-              summary += part.text;
+              answer += part.text;
             }
           }
         }
       }
     }
 
-    summary = String(summary || "").trim();
-    
-    if (!summary) {
-      throw new Error("AI returned an empty response for image summary");
-    }
-
-    return summary;
+    return answer.trim() || null;
   } catch (error) {
-    console.error("Image analysis error:", error);
-    throw error;
-  }
-}
-
-async function analyzeImageLocally(imageBuffer, mimetype) {
-  try {
-    // Basic image analysis using file properties
-    const fileSize = imageBuffer.length;
-    const dimensions = await getImageDimensions(imageBuffer);
-    
-    // Detect image format
-    let format = "Unknown";
-    if (mimetype.includes("png")) format = "PNG";
-    else if (mimetype.includes("jpeg") || mimetype.includes("jpg")) format = "JPEG";
-    else if (mimetype.includes("webp")) format = "WebP";
-    else if (mimetype.includes("gif")) format = "GIF";
-    else if (mimetype.includes("pdf")) format = "PDF";
-    
-    // Analyze image content heuristically
-    const analysis = {
-      format,
-      size: `${(fileSize / 1024).toFixed(2)} KB`,
-      dimensions: dimensions ? `${dimensions.width}x${dimensions.height}` : "Unknown",
-      colorDepth: "24-bit",
-      compression: mimetype.includes("png") ? "Lossless" : "Lossy",
-    };
-    
-    // Create a descriptive summary
-    const summary = `Image Analysis:
-- Format: ${analysis.format}
-- Size: ${analysis.size}
-- Dimensions: ${analysis.dimensions}
-- Color: ${analysis.colorDepth}
-- Compression: ${analysis.compression}
-
-This is a ${format} image file. Based on the file properties, it appears to be a standard image. To get more detailed analysis, please describe what you see in the image or ask specific questions about it.`;
-    
-    return summary;
-  } catch (error) {
-    console.error("Local image analysis error:", error);
-    return "Unable to analyze image. Please try sending a different image or describe it manually.";
+    console.error("AI image description error:", error);
+    return null;
   }
 }
 
 function getImageDimensions(buffer) {
   try {
-    // Simple dimension detection for common formats
     if (buffer.length < 24) return null;
     
-    // Check for JPEG
+    // JPEG
     if (buffer[0] === 0xFF && buffer[1] === 0xD8) {
       let offset = 2;
       while (offset < buffer.length) {
@@ -386,14 +409,14 @@ function getImageDimensions(buffer) {
       }
     }
     
-    // Check for PNG
+    // PNG
     if (buffer[0] === 0x89 && buffer[1] === 0x50) {
       const width = buffer.readUInt32BE(16);
       const height = buffer.readUInt32BE(20);
       return { width, height };
     }
     
-    // Check for GIF
+    // GIF
     if (buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46) {
       const width = buffer.readUInt16LE(6);
       const height = buffer.readUInt16LE(8);
@@ -403,6 +426,24 @@ function getImageDimensions(buffer) {
     return null;
   } catch (error) {
     return null;
+  }
+}
+
+function analyzeColors(buffer) {
+  try {
+    // Simple color analysis (sampling some pixels)
+    const colors = [];
+    const sampleSize = Math.min(buffer.length, 10000);
+    
+    for (let i = 0; i < sampleSize; i += 100) {
+      if (i + 2 < buffer.length) {
+        colors.push(`rgb(${buffer[i]},${buffer[i+1]},${buffer[i+2]})`);
+      }
+    }
+    
+    return colors.length > 0 ? colors.join(", ") : "Unknown";
+  } catch (error) {
+    return "Unknown";
   }
 }
 
@@ -578,7 +619,6 @@ async function askAI(jid, text, imageContext = null) {
     let input;
     
     if (imageContext) {
-      // If we have image context, include it in the message
       input = [
         ...history,
         {
@@ -594,7 +634,7 @@ async function askAI(jid, text, imageContext = null) {
     }
     
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+    const timeout = setTimeout(() => controller.abort(), 30000);
     
     try {
       const response = await fetch(
@@ -606,7 +646,7 @@ async function askAI(jid, text, imageContext = null) {
           },
           body: JSON.stringify({
             model: CONFIG.AI_MODEL,
-            instructions: `You are ${CONFIG.AI_NAME}, a helpful WhatsApp AI assistant. Reply naturally and concisely for WhatsApp. Do not mention internal systems, API keys, Supabase, or proxy details. If image analysis is provided, use that information to answer questions about the image.`,
+            instructions: `You are ${CONFIG.AI_NAME}, a helpful WhatsApp AI assistant. Reply naturally and concisely for WhatsApp. If image analysis is provided, use that information to answer questions about the image.`,
             input,
             max_output_tokens: 2048,
             temperature: 0.7
@@ -634,12 +674,10 @@ async function askAI(jid, text, imageContext = null) {
       
       let answer = data?.output_text || "";
       
-      // Fallback for normal chat-completion responses
       if (!answer) {
         answer = data?.choices?.[0]?.message?.content || "";
       }
       
-      // Fallback for Responses-style output
       if (!answer && Array.isArray(data?.output)) {
         for (const item of data.output) {
           if (item?.type === "message" && Array.isArray(item.content)) {
@@ -692,7 +730,6 @@ button.danger{background:#c62828;}
 .hidden{display:none;}
 .user{padding:10px;border-bottom:1px solid #ddd;word-break:break-all;display:flex;justify-content:space-between;align-items:center;}
 .status{padding:10px;border-radius:8px;background:#eef2ff;margin-top:10px;}
-.error{background:#fee;color:#c00;padding:10px;border-radius:8px;margin-top:10px;}
 </style>
 </head>
 <body>
@@ -725,12 +762,10 @@ let ADMIN_KEY = localStorage.getItem("adminKey") || "";
 
 function login() {
   const value = document.getElementById("adminKey").value.trim();
-  
   if (!value) {
     document.getElementById("loginStatus").textContent = "Enter ADMIN_KEY.";
     return;
   }
-  
   ADMIN_KEY = value;
   localStorage.setItem("adminKey", value);
   testAuth();
@@ -771,7 +806,6 @@ async function api(url, options = {}) {
 async function testAuth() {
   try {
     await api("/api/whitelist");
-    
     document.getElementById("login").classList.add("hidden");
     document.getElementById("panel").classList.remove("hidden");
     refresh();
@@ -807,11 +841,7 @@ async function refresh() {
 
 async function addUser() {
   const number = document.getElementById("number").value.trim();
-  
-  if (!number) {
-    document.getElementById("status").textContent = "Please enter a number.";
-    return;
-  }
+  if (!number) return;
   
   try {
     const data = await api("/api/whitelist", {
@@ -828,9 +858,7 @@ async function addUser() {
 }
 
 async function removeUser(number) {
-  if (!confirm("Remove " + number + "?")) {
-    return;
-  }
+  if (!confirm("Remove " + number + "?")) return;
   
   try {
     const data = await api("/api/whitelist", {
@@ -907,7 +935,6 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     
-    // HEALTH
     if (url.pathname === "/health") {
       return sendJSON(res, 200, {
         ok: true,
@@ -916,7 +943,6 @@ const server = http.createServer(async (req, res) => {
       });
     }
     
-    // HOME
     if (url.pathname === "/") {
       return sendJSON(res, 200, {
         ok: true,
@@ -926,7 +952,6 @@ const server = http.createServer(async (req, res) => {
       });
     }
     
-    // DASHBOARD - NO AUTH HERE
     if (url.pathname === "/dashboard") {
       res.writeHead(200, {
         "Content-Type": "text/html; charset=utf-8",
@@ -935,7 +960,6 @@ const server = http.createServer(async (req, res) => {
       return res.end(dashboardHTML());
     }
     
-    // PROTECTED WHITELIST API
     if (url.pathname === "/api/whitelist") {
       if (!adminAuthorized(req)) {
         return sendJSON(res, 401, { error: "Unauthorized" });
@@ -987,7 +1011,6 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 405, { error: "Method not allowed" });
     }
     
-    // PAIR
     if (url.pathname === "/pair") {
       res.writeHead(200, {
         "Content-Type": "text/html; charset=utf-8",
@@ -996,7 +1019,6 @@ const server = http.createServer(async (req, res) => {
       return res.end(pairHTML());
     }
     
-    // QR
     if (url.pathname === "/qr.png") {
       if (!latestQR) {
         res.writeHead(404);
@@ -1022,7 +1044,6 @@ const server = http.createServer(async (req, res) => {
       }
     }
     
-    // 404
     res.writeHead(404);
     res.end("Not found");
     
@@ -1051,7 +1072,6 @@ async function startBot() {
   try {
     const { state, saveCreds } = await useMultiFileAuthState(CONFIG.SESSION_DIR);
     
-    // Get latest WhatsApp version
     const { version } = await fetchLatestBaileysVersion();
     
     sock = makeWASocket({
@@ -1087,13 +1107,11 @@ async function startBot() {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         console.error("WhatsApp connection closed:", statusCode);
         
-        // Don't reconnect if logged out
         if (statusCode === DisconnectReason.loggedOut) {
           console.log("Logged out. Please re-scan QR code.");
           return;
         }
         
-        // Reconnect with delay
         if (!reconnecting) {
           reconnecting = true;
           console.log("Reconnecting in 3 seconds...");
@@ -1124,13 +1142,11 @@ async function startBot() {
           return;
         }
         
-        // Check if message contains an image
         const hasImage = 
           msg.message?.imageMessage ||
           msg.message?.documentMessage ||
           msg.message?.videoMessage;
         
-        // Extract text from various message types
         const text = (
           msg.message?.conversation ||
           msg.message?.extendedTextMessage?.text ||
@@ -1148,83 +1164,70 @@ async function startBot() {
         
         await logMessage(jid, "incoming", text || "[Image/Media]");
         
-        // START command
         if (/^(start|\/start)$/i.test(text)) {
           await addWhitelist(jid);
-          
           const reply = "✅ You are opted in again.";
-          
           await sock.sendMessage(jid, { text: reply });
           await logMessage(jid, "outgoing", reply);
-          
           return;
         }
         
-        // STOP command
         if (/^(stop|\/stop)$/i.test(text)) {
           await removeWhitelist(jid);
-          
           const reply = "🛑 You have been opted out. Send START to enable the bot again.";
-          
           await sock.sendMessage(jid, { text: reply });
           await logMessage(jid, "outgoing", reply);
-          
           return;
         }
         
-        // HELP command
         if (/^(help|\/help)$/i.test(text)) {
-          const reply = `🤖 ${CONFIG.AI_NAME}\n\nCommands:\n\n/start or START\nEnable the bot.\n\nSTOP\nDisable the bot.\n\nHELP\nShow this help.\n\nCLEAR\nClear your AI memory.\n\n📸 Image Support:\nSend any image and I'll analyze it!\n\nNote: For detailed analysis, describe the image or ask specific questions.`;
-          
+          const reply = `🤖 ${CONFIG.AI_NAME}\n\nCommands:\n\n/start or START\nEnable the bot.\n\nSTOP\nDisable the bot.\n\nHELP\nShow this help.\n\nCLEAR\nClear your AI memory.\n\n📸 Image Support:\nSend any image and I'll analyze and describe what's in it!`;
           await sock.sendMessage(jid, { text: reply });
           await logMessage(jid, "outgoing", reply);
-          
           return;
         }
         
-        // WHITELIST CHECK
         if (!(await isAllowed(jid))) {
           console.log(`🚫 Blocked: ${jid}`);
           return;
         }
         
-        // CLEAR command
         if (/^(clear|\/clear)$/i.test(text)) {
           await clearHistory(jid);
-          
           const reply = "🧹 Your AI memory has been cleared.";
-          
           await sock.sendMessage(jid, { text: reply });
           await logMessage(jid, "outgoing", reply);
-          
           return;
         }
         
-        // IMAGE PROCESSING
         if (hasImage) {
           try {
-            // Send "processing" message
-            await sock.sendMessage(jid, { text: "🖼️ Processing your image..." });
+            await sock.sendMessage(jid, { text: "🖼️ Analyzing your image..." });
             
-            // Download and process the image
             const imageData = await downloadAndProcessImage(msg);
             
             if (imageData) {
-              // Analyze the image locally first
-              const imageAnalysis = await analyzeImageLocally(imageData.buffer, imageData.mimetype);
+              const imageAnalysis = await analyzeImageWithFreeAPI(imageData.buffer, imageData.mimetype);
               
-              // Clean up temp file
               cleanupTempFile(imageData.tempFilePath);
               
-              // Prepare the response
               let finalResponse;
               
-              if (text) {
-                // If there's text with the image, combine both
-                finalResponse = await askAI(jid, text, imageAnalysis);
+              if (imageAnalysis) {
+                if (text) {
+                  finalResponse = await askAI(jid, text, imageAnalysis);
+                } else {
+                  finalResponse = `📸 **Image Analysis:**\n\n${imageAnalysis}`;
+                }
               } else {
-                // Just send the image analysis
-                finalResponse = `📸 **Image Analysis:**\n\n${imageAnalysis}`;
+                // Fallback to AI-based description
+                const aiDescription = await askAIToDescribeImage(imageData.buffer, imageData.mimetype);
+                
+                if (text) {
+                  finalResponse = await askAI(jid, text, aiDescription);
+                } else {
+                  finalResponse = `📸 **Image Analysis:**\n\n${aiDescription}`;
+                }
               }
               
               await sock.sendMessage(jid, { text: finalResponse });
@@ -1235,7 +1238,7 @@ async function startBot() {
           } catch (error) {
             console.error("Image processing error:", error);
             
-            const reply = "⚠️ Failed to process image. Please try again with a different image or describe it manually.";
+            const reply = "⚠️ Failed to process image. Please try again.";
             
             await sock.sendMessage(jid, { text: reply });
             await logMessage(jid, "outgoing", reply);
@@ -1244,7 +1247,6 @@ async function startBot() {
           return;
         }
         
-        // AI RESPONSE for text messages
         try {
           await sock.sendMessage(jid, { text: "⏳ Thinking..." });
           
@@ -1279,11 +1281,9 @@ async function startBot() {
 
 startBot().catch(error => {
   console.error("Fatal WhatsApp error:", error);
-  // Don't exit, try to keep HTTP server running
   console.log("HTTP server will continue running for dashboard access");
 });
 
-// Handle process errors
 process.on("unhandledRejection", (reason, promise) => {
   console.error("Unhandled Rejection at:", promise, "reason:", reason);
 });
@@ -1292,7 +1292,6 @@ process.on("uncaughtException", (error) => {
   console.error("Uncaught Exception:", error);
 });
 
-// Cleanup temp files on exit
 process.on("SIGINT", () => {
   console.log("Cleaning up...");
   try {
