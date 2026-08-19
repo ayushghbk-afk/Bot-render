@@ -41,7 +41,6 @@ const CONFIG = {
   SIGHTENGINE_API_SECRET: process.env.SIGHTENGINE_API_SECRET || "",
   AI_RATE_LIMIT: Number(process.env.AI_RATE_LIMIT || 10),
   MEDIA_RATE_LIMIT: Number(process.env.MEDIA_RATE_LIMIT || 3),
-  YTDL_API_URL: process.env.YTDL_API_URL || "",
 };
 
 /* =========================================================
@@ -185,6 +184,120 @@ function cleanOldTempFiles() {
     });
   } catch (error) {
     console.error("Temp cleanup error:", error);
+  }
+}
+
+/* =========================================================
+   YOUTUBE DOWNLOADER (Using Public APIs)
+========================================================= */
+
+async function getYouTubeDownloadUrl(url, type = "mp4") {
+  try {
+    console.log(`🔍 Fetching YouTube ${type} download URL...`);
+    
+    // Try multiple public APIs
+    const apis = [
+      {
+        name: "api1",
+        url: `https://api.vevioz.com/api/button/${encodeURIComponent(url)}`
+      },
+      {
+        name: "api2",
+        url: `https://api.davidcyriltech.my.id/download/${encodeURIComponent(url)}`
+      },
+      {
+        name: "api3",
+        url: `https://api.ryzendesu.vip/api/downloader/yt${type === "mp3" ? "mp3" : "mp4"}?url=${encodeURIComponent(url)}`
+      }
+    ];
+    
+    for (const api of apis) {
+      try {
+        const response = await axios.get(api.url, {
+          timeout: 30000,
+          maxRedirects: 5,
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+          }
+        });
+        
+        let downloadUrl = null;
+        
+        if (type === "mp3") {
+          // Look for audio URL
+          downloadUrl = 
+            response.data?.audio ||
+            response.data?.result?.download?.url ||
+            response.data?.url ||
+            response.data?.download_url ||
+            response.data?.result?.url;
+        } else {
+          // Look for video URL
+          downloadUrl = 
+            response.data?.video ||
+            response.data?.result?.download?.url ||
+            response.data?.url ||
+            response.data?.download_url ||
+            response.data?.result?.url;
+        }
+        
+        if (downloadUrl) {
+          console.log(`✅ Got download URL from ${api.name}`);
+          return downloadUrl;
+        }
+      } catch (error) {
+        console.error(`${api.name} failed:`, error.message);
+        continue;
+      }
+    }
+    
+    return null;
+  } catch (error) {
+    console.error("YouTube download error:", error);
+    return null;
+  }
+}
+
+async function downloadYouTubeMedia(url, type = "mp4") {
+  try {
+    const downloadUrl = await getYouTubeDownloadUrl(url, type);
+    
+    if (!downloadUrl) {
+      return null;
+    }
+    
+    console.log(`📥 Downloading ${type} from: ${downloadUrl}`);
+    
+    const response = await axios({
+      method: "get",
+      url: downloadUrl,
+      responseType: "arraybuffer",
+      timeout: 120000,
+      maxContentLength: 50 * 1024 * 1024, // 50MB
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+      }
+    });
+    
+    const buffer = Buffer.from(response.data);
+    
+    if (buffer.length > 50 * 1024 * 1024) {
+      throw new Error("File too large");
+    }
+    
+    const extension = type === "mp3" ? ".mp3" : ".mp4";
+    const tempFilePath = generateTempFileName(extension);
+    fs.writeFileSync(tempFilePath, buffer);
+    
+    return {
+      buffer,
+      tempFilePath,
+      mimetype: type === "mp3" ? "audio/mpeg" : "video/mp4",
+      fileSize: buffer.length
+    };
+  } catch (error) {
+    console.error("Download error:", error.message);
+    return null;
   }
 }
 
@@ -912,6 +1025,7 @@ async function startBot() {
 async function processMessage(msg, jid) {
   let imageData = null;
   let documentData = null;
+  let mediaData = null;
   
   try {
     const hasImage = !!msg.message?.imageMessage;
@@ -941,11 +1055,6 @@ async function processMessage(msg, jid) {
         return;
       }
       
-      if (!CONFIG.YTDL_API_URL) {
-        await sock.sendMessage(jid, { text: "❌ YouTube downloader is not configured." });
-        return;
-      }
-      
       if (!checkRateLimit(mediaRateLimit, jid, CONFIG.MEDIA_RATE_LIMIT)) {
         await sock.sendMessage(jid, { text: "⚠️ Download limit reached. Wait a minute." });
         return;
@@ -954,15 +1063,18 @@ async function processMessage(msg, jid) {
       await sock.sendMessage(jid, { text: "⏳ Downloading audio..." });
       
       try {
-        const apiUrl = `${CONFIG.YTDL_API_URL}/ytmp3?url=${encodeURIComponent(url)}`;
+        mediaData = await downloadYouTubeMedia(url, "mp3");
         
-        await sock.sendMessage(jid, {
-          audio: { url: apiUrl },
-          mimetype: "audio/mpeg",
-          fileName: "youtube-audio.mp3"
-        });
-        
-        await logMessage(jid, "outgoing", "YouTube audio sent");
+        if (mediaData) {
+          await sock.sendMessage(jid, {
+            audio: mediaData.buffer,
+            mimetype: "audio/mpeg",
+            fileName: "youtube-audio.mp3"
+          });
+          await logMessage(jid, "outgoing", "YouTube audio sent");
+        } else {
+          await sock.sendMessage(jid, { text: "❌ Failed to download audio. Please try another video." });
+        }
       } catch (err) {
         console.error("YTMP3 error:", err);
         await sock.sendMessage(jid, { text: "❌ Failed to download the audio." });
@@ -981,11 +1093,6 @@ async function processMessage(msg, jid) {
         return;
       }
       
-      if (!CONFIG.YTDL_API_URL) {
-        await sock.sendMessage(jid, { text: "❌ YouTube downloader is not configured." });
-        return;
-      }
-      
       if (!checkRateLimit(mediaRateLimit, jid, CONFIG.MEDIA_RATE_LIMIT)) {
         await sock.sendMessage(jid, { text: "⚠️ Download limit reached. Wait a minute." });
         return;
@@ -994,16 +1101,19 @@ async function processMessage(msg, jid) {
       await sock.sendMessage(jid, { text: "⏳ Downloading video..." });
       
       try {
-        const apiUrl = `${CONFIG.YTDL_API_URL}/ytmp4?url=${encodeURIComponent(url)}`;
+        mediaData = await downloadYouTubeMedia(url, "mp4");
         
-        await sock.sendMessage(jid, {
-          video: { url: apiUrl },
-          mimetype: "video/mp4",
-          fileName: "youtube-video.mp4",
-          caption: "🎬 YouTube video"
-        });
-        
-        await logMessage(jid, "outgoing", "YouTube video sent");
+        if (mediaData) {
+          await sock.sendMessage(jid, {
+            video: mediaData.buffer,
+            mimetype: "video/mp4",
+            fileName: "youtube-video.mp4",
+            caption: "🎬 YouTube video"
+          });
+          await logMessage(jid, "outgoing", "YouTube video sent");
+        } else {
+          await sock.sendMessage(jid, { text: "❌ Failed to download video. Please try another video." });
+        }
       } catch (err) {
         console.error("YTMP4 error:", err);
         await sock.sendMessage(jid, { text: "❌ Failed to download the video." });
@@ -1012,7 +1122,7 @@ async function processMessage(msg, jid) {
     }
     
     // Help command
-    if (/^(help|\/help|\.help)$/i.test(text)) {
+    if (/^(help|\/help|\.help|menu|\/menu)$/i.test(text)) {
       const reply = `🤖 ${CONFIG.AI_NAME} - Commands\n\n` +
         `📹 **YouTube Video:**\n.ytmp4 [YouTube URL]\n\n` +
         `🎵 **YouTube Audio:**\n.ytmp3 [YouTube URL]\n\n` +
@@ -1123,6 +1233,7 @@ async function processMessage(msg, jid) {
   } finally {
     if (imageData?.tempFilePath) cleanupTempFile(imageData.tempFilePath);
     if (documentData?.tempFilePath) cleanupTempFile(documentData.tempFilePath);
+    if (mediaData?.tempFilePath) cleanupTempFile(mediaData.tempFilePath);
   }
 }
 
