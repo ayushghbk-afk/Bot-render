@@ -106,13 +106,13 @@ let reconnecting = false;
 let reconnectAttempts = 0;
 
 // Message processing
-const processedMessages = new Map(); // messageId -> timestamp
-const userQueues = new Map(); // jid -> Promise
-const pendingLinks = new Map(); // jid -> { url, timestamp }
+const processedMessages = new Map();
+const userQueues = new Map();
+const pendingLinks = new Map();
 
 // Rate limiting
-const aiRateLimit = new Map(); // jid -> { count, resetTime }
-const mediaRateLimit = new Map(); // jid -> { count, resetTime }
+const aiRateLimit = new Map();
+const mediaRateLimit = new Map();
 
 /* =========================================================
    HELPERS
@@ -267,70 +267,6 @@ function cleanOldTempFiles() {
 }
 
 /* =========================================================
-   TOOL SYSTEM
-========================================================= */
-
-const tools = {
-  calculator: {
-    name: "calculator",
-    description: "Perform mathematical calculations",
-    parameters: {
-      expression: "string"
-    },
-    execute: async (expression) => {
-      try {
-        const result = math.evaluate(expression);
-        return String(result);
-      } catch (error) {
-        return "Invalid expression";
-      }
-    }
-  },
-  
-  getTime: {
-    name: "getTime",
-    description: "Get current time",
-    parameters: {},
-    execute: async () => {
-      return new Date().toISOString();
-    }
-  }
-};
-
-async function routeToAgent(jid, text, history) {
-  try {
-    const lowerText = text.toLowerCase();
-    
-    // Calculator
-    if (/^[\d\s\+\-\*\/\(\)\.\%\^]+$/.test(text) && /[\d]/.test(text)) {
-      const result = await tools.calculator.execute(text);
-      const response = `🧮 Result: ${result}`;
-      
-      await saveHistory(jid, "user", text);
-      await saveHistory(jid, "assistant", response);
-      
-      return response;
-    }
-    
-    // Time query
-    if (/what.*time|current time|time now/i.test(text)) {
-      const time = await tools.getTime.execute();
-      const response = `🕐 Current time: ${time}`;
-      
-      await saveHistory(jid, "user", text);
-      await saveHistory(jid, "assistant", response);
-      
-      return response;
-    }
-    
-    return null;
-  } catch (error) {
-    console.error("Agent routing error:", error);
-    return null;
-  }
-}
-
-/* =========================================================
    DOCUMENT PROCESSING
 ========================================================= */
 
@@ -338,24 +274,20 @@ async function extractTextFromDocument(documentData) {
   try {
     const { buffer, mimetype, filename } = documentData;
     
-    // PDF
     if (mimetype.includes("pdf") || filename.endsWith(".pdf")) {
       const data = await pdfParse(buffer);
       return data.text.slice(0, 5000);
     }
     
-    // DOCX
     if (mimetype.includes("docx") || filename.endsWith(".docx")) {
       const result = await mammoth.extractRawText({ buffer });
       return result.value.slice(0, 5000);
     }
     
-    // TXT
     if (mimetype.includes("text") || filename.endsWith(".txt")) {
       return buffer.toString("utf8").slice(0, 5000);
     }
     
-    // JSON
     if (mimetype.includes("json") || filename.endsWith(".json")) {
       try {
         const parsed = JSON.parse(buffer.toString("utf8"));
@@ -365,7 +297,6 @@ async function extractTextFromDocument(documentData) {
       }
     }
     
-    // CSV
     if (mimetype.includes("csv") || filename.endsWith(".csv")) {
       return buffer.toString("utf8").slice(0, 5000);
     }
@@ -892,7 +823,7 @@ function adminAuthorized(req) {
 }
 
 /* =========================================================
-   DASHBOARD HTML
+   DASHBOARD HTML (Public with Login Form)
 ========================================================= */
 
 function dashboardHTML() {
@@ -900,61 +831,111 @@ function dashboardHTML() {
 <html>
 <head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WhatsApp AI Bot</title>
+<title>WhatsApp AI Bot - Admin Dashboard</title>
 <style>
-body{font-family:Arial,sans-serif;background:#f3f4f6;margin:0;color:#111;}
+*{box-sizing:border-box;}
+body{font-family:Arial,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);margin:0;min-height:100vh;color:#111;}
 main{max-width:700px;margin:auto;padding:20px;}
-.card{background:white;padding:18px;margin:12px 0;border-radius:16px;box-shadow:0 2px 10px #0001;}
-input,button{width:100%;box-sizing:border-box;padding:13px;margin:6px 0;font-size:16px;border-radius:10px;border:1px solid #ccc;}
-button{background:#111;color:white;border:0;cursor:pointer;}
-button.danger{background:#c62828;}
+.header{text-align:center;color:white;padding:30px 20px;}
+.header h1{margin:0;font-size:2em;}
+.header p{margin:10px 0 0;opacity:0.9;}
+.card{background:white;padding:20px;margin:15px 0;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,0.2);}
+input,button{width:100%;padding:13px;margin:8px 0;font-size:16px;border-radius:10px;border:2px solid #ddd;transition:all 0.3s;}
+input:focus{border-color:#667eea;outline:none;}
+button{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;border:0;cursor:pointer;font-weight:bold;}
+button:hover{opacity:0.9;transform:translateY(-2px);}
+button.danger{background:linear-gradient(135deg,#f56565 0%,#c53030 100%);}
+button.secondary{background:linear-gradient(135deg,#48bb78 0%,#38a169 100%);}
 .hidden{display:none;}
-.user{padding:10px;border-bottom:1px solid #ddd;word-break:break-all;display:flex;justify-content:space-between;align-items:center;}
-.status{padding:10px;border-radius:8px;background:#eef2ff;margin-top:10px;}
+.user{padding:12px;border-bottom:1px solid #e2e8f0;display:flex;justify-content:space-between;align-items:center;word-break:break-all;}
+.status{padding:12px;border-radius:8px;background:#f7fafc;margin-top:10px;border-left:4px solid #667eea;}
+.error{background:#fff5f5;color:#c53030;padding:10px;border-radius:8px;margin-top:10px;border-left:4px solid #f56565;}
+.success{background:#f0fff4;color:#276749;padding:10px;border-radius:8px;margin-top:10px;border-left:4px solid #48bb78;}
+.badge{display:inline-block;padding:4px 10px;border-radius:20px;font-size:12px;font-weight:bold;}
+.badge.online{background:#c6f6d5;color:#276749;}
+.badge.offline{background:#fed7d7;color:#9b2c2c;}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:10px;}
+.stat-box{background:#f7fafc;padding:15px;border-radius:10px;text-align:center;}
+.stat-box h3{margin:0;font-size:24px;color:#667eea;}
+.stat-box p{margin:5px 0 0;font-size:12px;color:#718096;}
 </style>
 </head>
 <body>
 <main>
-<h2>🤖 WhatsApp AI Bot</h2>
-<div id="login" class="card">
-<h3>🔐 Admin Login</h3>
-<input id="adminKey" type="password" placeholder="Enter ADMIN_KEY">
-<button onclick="login()">Login</button>
-<p id="loginStatus"></p>
+<div class="header">
+<h1>🤖 WhatsApp AI Bot</h1>
+<p>Admin Dashboard</p>
 </div>
+
+<div id="login" class="card">
+<h2>🔐 Admin Login</h2>
+<p style="color:#718096;">Enter your admin key to access the dashboard</p>
+<input id="adminKey" type="password" placeholder="Enter ADMIN_KEY" onkeypress="if(event.key==='Enter')login()">
+<button onclick="login()">Login</button>
+<p id="loginStatus" class="error hidden"></p>
+</div>
+
 <div id="panel" class="hidden">
 <div class="card">
-<h3>📊 Status</h3>
-<p id="botStatus">Loading...</p>
-<button onclick="refresh()">🔄 Refresh</button>
-<button onclick="location.href='/pair'">📱 WhatsApp Pairing</button>
+<h2>📊 Status</h2>
+<p>Bot Status: <span id="botStatus" class="badge">Loading...</span></p>
+<div class="stats">
+<div class="stat-box"><h3 id="statUsers">0</h3><p>Users</p></div>
+<div class="stat-box"><h3 id="statMessages">0</h3><p>Messages</p></div>
+<div class="stat-box"><h3 id="statUptime">0</h3><p>Uptime (s)</p></div>
 </div>
+<button onclick="refresh()">🔄 Refresh</button>
+<button class="secondary" onclick="location.href='/pair'">📱 WhatsApp Pairing</button>
+</div>
+
 <div class="card">
-<h3>👥 Whitelist</h3>
-<input id="number" placeholder="+91 9876543210">
-<button onclick="addUser()">➕ Add user</button>
+<h2>👥 Whitelist Management</h2>
+<input id="number" placeholder="Enter WhatsApp number (e.g., +91 9876543210)" onkeypress="if(event.key==='Enter')addUser()">
+<button onclick="addUser()">➕ Add User</button>
 <div id="users">Loading...</div>
 <p id="status" class="status"></p>
 </div>
 </div>
 </main>
+
 <script>
 let ADMIN_KEY = localStorage.getItem("adminKey") || "";
 
+function showError(elementId, message) {
+  const el = document.getElementById(elementId);
+  el.textContent = message;
+  el.classList.remove("hidden");
+  setTimeout(() => el.classList.add("hidden"), 5000);
+}
+
 function login() {
   const value = document.getElementById("adminKey").value.trim();
-  if (!value) return;
+  if (!value) {
+    showError("loginStatus", "Please enter ADMIN_KEY.");
+    return;
+  }
   ADMIN_KEY = value;
   localStorage.setItem("adminKey", value);
   testAuth();
 }
 
 async function api(url, options = {}) {
-  options.headers = {...(options.headers || {}), "X-Admin-Key": ADMIN_KEY, "Content-Type": "application/json"};
+  options.headers = {
+    ...(options.headers || {}),
+    "X-Admin-Key": ADMIN_KEY,
+    "Content-Type": "application/json"
+  };
+  
   const response = await fetch(url, options);
   const text = await response.text();
+  
   let data;
-  try { data = JSON.parse(text); } catch { throw new Error("Invalid response"); }
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error("Server returned invalid response.");
+  }
+  
   if (response.status === 401) {
     localStorage.removeItem("adminKey");
     ADMIN_KEY = "";
@@ -962,7 +943,11 @@ async function api(url, options = {}) {
     document.getElementById("panel").classList.add("hidden");
     throw new Error("Wrong ADMIN_KEY.");
   }
-  if (!response.ok) throw new Error(data.error || "Request failed.");
+  
+  if (!response.ok) {
+    throw new Error(data.error || "Request failed.");
+  }
+  
   return data;
 }
 
@@ -973,7 +958,7 @@ async function testAuth() {
     document.getElementById("panel").classList.remove("hidden");
     refresh();
   } catch (error) {
-    document.getElementById("loginStatus").textContent = error.message;
+    showError("loginStatus", error.message);
   }
 }
 
@@ -982,12 +967,29 @@ async function refresh() {
     const data = await api("/api/whitelist");
     document.getElementById("users").innerHTML = data.users.length
       ? data.users.map(user =>
-          '<div class="user"><span>' + user + '</span> <button class="danger" onclick="removeUser(\'' + user + '\')">Remove</button></div>'
+          '<div class="user"><span>' + user + '</span> <button class="danger" style="width:auto;padding:8px 15px;" onclick="removeUser(\'' + user + '\')">Remove</button></div>'
         ).join("")
-      : "<p>No users.</p>";
+      : "<p>No whitelisted users.</p>";
     
     const health = await fetch("/health").then(r => r.json());
-    document.getElementById("botStatus").textContent = health.connected ? "🟢 WhatsApp connected" : "🟡 WhatsApp not connected";
+    const botStatus = document.getElementById("botStatus");
+    if (health.connected) {
+      botStatus.textContent = "🟢 Connected";
+      botStatus.className = "badge online";
+    } else {
+      botStatus.textContent = "🟡 Not Connected";
+      botStatus.className = "badge offline";
+    }
+    
+    // Try to get stats
+    try {
+      const stats = await api("/api/stats");
+      document.getElementById("statUsers").textContent = stats.users || 0;
+      document.getElementById("statMessages").textContent = stats.messages || 0;
+      document.getElementById("statUptime").textContent = Math.floor(stats.uptime || 0);
+    } catch (error) {
+      console.log("Stats not available");
+    }
   } catch (error) {
     document.getElementById("status").textContent = error.message;
   }
@@ -995,7 +997,10 @@ async function refresh() {
 
 async function addUser() {
   const number = document.getElementById("number").value.trim();
-  if (!number) return;
+  if (!number) {
+    document.getElementById("status").textContent = "Please enter a number.";
+    return;
+  }
   
   try {
     const data = await api("/api/whitelist/add", {
@@ -1004,14 +1009,16 @@ async function addUser() {
     });
     document.getElementById("number").value = "";
     document.getElementById("status").textContent = data.message;
+    document.getElementById("status").className = "status success";
     refresh();
   } catch (error) {
     document.getElementById("status").textContent = error.message;
+    document.getElementById("status").className = "status error";
   }
 }
 
 async function removeUser(number) {
-  if (!confirm("Remove " + number + "?")) return;
+  if (!confirm("Remove " + number + " from whitelist?")) return;
   
   try {
     const data = await api("/api/whitelist/remove", {
@@ -1019,32 +1026,103 @@ async function removeUser(number) {
       body: JSON.stringify({ number })
     });
     document.getElementById("status").textContent = data.message;
+    document.getElementById("status").className = "status success";
     refresh();
   } catch (error) {
     document.getElementById("status").textContent = error.message;
+    document.getElementById("status").className = "status error";
   }
 }
 
-if (ADMIN_KEY) testAuth();
+// Auto-login if key is saved
+if (ADMIN_KEY) {
+  testAuth();
+}
 </script>
 </body>
 </html>`;
 }
 
 /* =========================================================
-   PAIR PAGE
+   PAIR PAGE (Public)
 ========================================================= */
 
 function pairHTML() {
   if (botConnected) {
-    return `<!doctype html><meta name="viewport" content="width=device-width"><div style="font-family:Arial;text-align:center;padding:30px"><h2>✅ WhatsApp Connected</h2><p>No QR scan required.</p></div>`;
+    return `<!doctype html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WhatsApp Connected</title>
+<style>
+body{font-family:Arial,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;}
+.card{background:white;padding:40px;border-radius:20px;text-align:center;box-shadow:0 10px 30px rgba(0,0,0,0.2);}
+h2{color:#276749;margin:0 0 20px;}
+p{color:#718096;}
+</style>
+</head>
+<body>
+<div class="card">
+<h2>✅ WhatsApp Connected</h2>
+<p>Your bot is connected and ready to use!</p>
+<p>Go to <a href="/dashboard">Dashboard</a></p>
+</div>
+</body>
+</html>`;
   }
   
   if (!latestQR) {
-    return `<!doctype html><meta name="viewport" content="width=device-width"><div style="font-family:Arial;text-align:center;padding:30px"><h2>📱 Waiting for QR...</h2><p>Refreshing...</p><script>setTimeout(()=>location.reload(), 3000);</script></div>`;
+    return `<!doctype html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Waiting for QR</title>
+<style>
+body{font-family:Arial,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;}
+.card{background:white;padding:40px;border-radius:20px;text-align:center;box-shadow:0 10px 30px rgba(0,0,0,0.2);}
+h2{color:#667eea;margin:0 0 20px;}
+</style>
+</head>
+<body>
+<div class="card">
+<h2>📱 Waiting for QR Code...</h2>
+<p>Refreshing...</p>
+<script>setTimeout(()=>location.reload(), 3000);</script>
+</div>
+</body>
+</html>`;
   }
   
-  return `<!doctype html><html><head><meta name="viewport" content="width=device-width"><meta http-equiv="refresh" content="4"><title>WhatsApp Pairing</title></head><body style="font-family:Arial;text-align:center;padding:20px"><h2>📱 Scan QR</h2><img style="max-width:90%;width:400px" src="/qr.png?t=${Date.now()}"><p>WhatsApp → Linked devices → Link a device</p></body></html>`;
+  return `<!doctype html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="4">
+<title>WhatsApp Pairing</title>
+<style>
+body{font-family:Arial,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;}
+.card{background:white;padding:40px;border-radius:20px;text-align:center;box-shadow:0 10px 30px rgba(0,0,0,0.2);max-width:90%;}
+h2{color:#667eea;margin:0 0 20px;}
+img{max-width:100%;width:400px;border-radius:10px;}
+p{color:#718096;margin:20px 0;}
+ol{text-align:left;display:inline-block;color:#718096;}
+</style>
+</head>
+<body>
+<div class="card">
+<h2>📱 Scan QR Code</h2>
+<img src="/qr.png?t=${Date.now()}" alt="WhatsApp QR Code">
+<p><strong>Steps:</strong></p>
+<ol>
+<li>Open WhatsApp on your phone</li>
+<li>Go to Settings → Linked Devices</li>
+<li>Tap "Link a Device"</li>
+<li>Scan this QR code</li>
+</ol>
+<p style="font-size:12px;opacity:0.7;">QR refreshes automatically every 4 seconds</p>
+</div>
+</body>
+</html>`;
 }
 
 /* =========================================================
@@ -1059,7 +1137,8 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/health") {
       return sendJSON(res, 200, {
         ok: true,
-        connected: botConnected
+        connected: botConnected,
+        uptime: process.uptime()
       });
     }
     
@@ -1069,78 +1148,127 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         service: "whatsapp-ai-bot",
         dashboard: "/dashboard",
-        pair: "/pair"
+        pair: "/pair",
+        health: "/health"
       });
     }
     
-    // PROTECTED ROUTES
-    if (url.pathname === "/dashboard" || url.pathname === "/pair" || url.pathname === "/qr.png" || url.pathname.startsWith("/api/") || url.pathname === "/status") {
+    // PUBLIC DASHBOARD
+    if (url.pathname === "/dashboard") {
+      res.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store"
+      });
+      return res.end(dashboardHTML());
+    }
+    
+    // PUBLIC PAIR PAGE
+    if (url.pathname === "/pair") {
+      res.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store"
+      });
+      return res.end(pairHTML());
+    }
+    
+    // PUBLIC QR CODE
+    if (url.pathname === "/qr.png") {
+      if (!latestQR) {
+        res.writeHead(404);
+        return res.end("QR not ready");
+      }
+      
+      try {
+        const png = await QRCode.toBuffer(latestQR, { width: 500, margin: 2 });
+        res.writeHead(200, {
+          "Content-Type": "image/png",
+          "Cache-Control": "no-store"
+        });
+        return res.end(png);
+      } catch (error) {
+        console.error("QR generation error:", error);
+        res.writeHead(500);
+        return res.end("Failed to generate QR");
+      }
+    }
+    
+    // PROTECTED API ROUTES
+    if (url.pathname.startsWith("/api/")) {
       if (!adminAuthorized(req)) {
         return sendJSON(res, 401, { error: "Unauthorized" });
       }
       
-      if (url.pathname === "/dashboard") {
-        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
-        return res.end(dashboardHTML());
-      }
-      
-      if (url.pathname === "/pair") {
-        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
-        return res.end(pairHTML());
-      }
-      
-      if (url.pathname === "/qr.png") {
-        if (!latestQR) {
-          res.writeHead(404);
-          return res.end("QR not ready");
-        }
-        
-        const png = await QRCode.toBuffer(latestQR, { width: 500, margin: 2 });
-        res.writeHead(200, { "Content-Type": "image/png", "Cache-Control": "no-store" });
-        return res.end(png);
-      }
-      
-      if (url.pathname === "/status") {
-        const stats = await getStats();
-        return sendJSON(res, 200, stats);
-      }
-      
-      // API ROUTES
+      // GET WHITELIST
       if (url.pathname === "/api/whitelist" && req.method === "GET") {
         const users = await getWhitelist();
         return sendJSON(res, 200, { users });
       }
       
+      // ADD WHITELIST
       if (url.pathname === "/api/whitelist/add" && req.method === "POST") {
-        const body = JSON.parse(await readRequestBody(req) || "{}");
-        const jid = normalizeJid(body.number);
-        if (!jid) return sendJSON(res, 400, { error: "Invalid number" });
-        await addWhitelist(jid);
-        return sendJSON(res, 200, { ok: true, message: `Added ${jid}` });
+        try {
+          const body = JSON.parse(await readRequestBody(req) || "{}");
+          const jid = normalizeJid(body.number);
+          
+          if (!jid) {
+            return sendJSON(res, 400, { error: "Invalid number" });
+          }
+          
+          await addWhitelist(jid);
+          return sendJSON(res, 200, { ok: true, message: `Added ${jid}` });
+        } catch (error) {
+          return sendJSON(res, 400, { error: "Invalid request" });
+        }
       }
       
+      // REMOVE WHITELIST
       if (url.pathname === "/api/whitelist/remove" && req.method === "POST") {
-        const body = JSON.parse(await readRequestBody(req) || "{}");
-        const jid = normalizeJid(body.number);
-        if (!jid) return sendJSON(res, 400, { error: "Invalid number" });
-        await removeWhitelist(jid);
-        return sendJSON(res, 200, { ok: true, message: `Removed ${jid}` });
+        try {
+          const body = JSON.parse(await readRequestBody(req) || "{}");
+          const jid = normalizeJid(body.number);
+          
+          if (!jid) {
+            return sendJSON(res, 400, { error: "Invalid number" });
+          }
+          
+          await removeWhitelist(jid);
+          return sendJSON(res, 200, { ok: true, message: `Removed ${jid}` });
+        } catch (error) {
+          return sendJSON(res, 400, { error: "Invalid request" });
+        }
       }
       
+      // CLEAR HISTORY
       if (url.pathname === "/api/history/clear" && req.method === "POST") {
-        const body = JSON.parse(await readRequestBody(req) || "{}");
-        const jid = normalizeJid(body.number);
-        if (!jid) return sendJSON(res, 400, { error: "Invalid number" });
-        await clearHistory(jid);
-        return sendJSON(res, 200, { ok: true, message: "History cleared" });
+        try {
+          const body = JSON.parse(await readRequestBody(req) || "{}");
+          const jid = normalizeJid(body.number);
+          
+          if (!jid) {
+            return sendJSON(res, 400, { error: "Invalid number" });
+          }
+          
+          await clearHistory(jid);
+          return sendJSON(res, 200, { ok: true, message: "History cleared" });
+        } catch (error) {
+          return sendJSON(res, 400, { error: "Invalid request" });
+        }
+      }
+      
+      // GET STATS
+      if (url.pathname === "/api/stats" && req.method === "GET") {
+        const stats = await getStats();
+        return sendJSON(res, 200, stats);
       }
     }
     
+    // 404
     res.writeHead(404);
     res.end("Not found");
     
   } catch (error) {
     console.error("HTTP error:", error);
+    
     if (!res.headersSent) {
       sendJSON(res, 500, { error: "Internal server error" });
     }
@@ -1231,7 +1359,6 @@ async function startBot() {
         const jid = msg.key.remoteJid;
         if (!jid || jid.endsWith("@g.us")) continue;
         
-        // Queue processing per user with captured promise
         const previous = userQueues.get(jid) || Promise.resolve();
         
         const current = previous
@@ -1248,7 +1375,6 @@ async function startBot() {
       }
     });
     
-    // Periodic cleanup
     setInterval(cleanOldProcessedMessages, 60000);
     setInterval(cleanOldTempFiles, 300000);
     
@@ -1281,7 +1407,6 @@ async function processMessage(msg, jid) {
     console.log(`📩 ${jid}: ${text || "[Media]"}`);
     await logMessage(jid, "incoming", text || "[Media]");
     
-    // Commands that always work
     if (/^(start|\/start)$/i.test(text)) {
       await addWhitelist(jid);
       const reply = "✅ You are now allowed to use the bot.";
@@ -1305,7 +1430,6 @@ async function processMessage(msg, jid) {
       return;
     }
     
-    // Check whitelist
     if (!(await isAllowed(jid))) {
       console.log(`🚫 Blocked: ${jid}`);
       return;
@@ -1319,7 +1443,6 @@ async function processMessage(msg, jid) {
       return;
     }
     
-    // Handle pending links
     if (pendingLinks.has(jid)) {
       const pending = pendingLinks.get(jid);
       
@@ -1378,7 +1501,6 @@ async function processMessage(msg, jid) {
       }
     }
     
-    // Image processing
     if (hasImage) {
       if (!checkRateLimit(mediaRateLimit, jid, CONFIG.MEDIA_RATE_LIMIT)) {
         await sock.sendMessage(jid, { text: "⚠️ Media limit reached. Wait a minute." });
@@ -1414,7 +1536,6 @@ async function processMessage(msg, jid) {
       return;
     }
     
-    // Document processing
     if (hasDocument) {
       if (!checkRateLimit(mediaRateLimit, jid, CONFIG.MEDIA_RATE_LIMIT)) {
         await sock.sendMessage(jid, { text: "⚠️ Media limit reached. Wait a minute." });
@@ -1450,7 +1571,6 @@ async function processMessage(msg, jid) {
       return;
     }
     
-    // URL handling
     const url = extractURL(text);
     if (url && isSupportedPlatform(url) && isSafeUrl(url)) {
       pendingLinks.set(jid, { url, timestamp: Date.now() });
@@ -1461,15 +1581,6 @@ async function processMessage(msg, jid) {
       return;
     }
     
-    // Agent routing
-    const agentResponse = await routeToAgent(jid, text, await getHistory(jid));
-    if (agentResponse) {
-      await sock.sendMessage(jid, { text: agentResponse });
-      await logMessage(jid, "outgoing", agentResponse);
-      return;
-    }
-    
-    // AI response
     if (!checkRateLimit(aiRateLimit, jid, CONFIG.AI_RATE_LIMIT)) {
       await sock.sendMessage(jid, { text: "⚠️ AI limit reached. Wait a minute." });
       return;
@@ -1483,7 +1594,6 @@ async function processMessage(msg, jid) {
   } catch (error) {
     console.error("Process message error:", error);
   } finally {
-    // Cleanup any remaining temp files
     if (imageData?.tempFilePath) cleanupTempFile(imageData.tempFilePath);
     if (documentData?.tempFilePath) cleanupTempFile(documentData.tempFilePath);
     if (videoData?.tempFilePath) cleanupTempFile(videoData.tempFilePath);
