@@ -18,16 +18,6 @@ const axios = require("axios");
 const FormData = require("form-data");
 const pdfParse = require("pdf-parse");
 const mammoth = require("mammoth");
-const { create, all } = require("mathjs");
-
-const math = create(all);
-math.import({
-  import: function () { throw new Error('Function import is disabled'); },
-  createUnit: function () { throw new Error('Function createUnit is disabled'); },
-  evaluate: function () { throw new Error('Function evaluate is disabled'); },
-  parse: function () { throw new Error('Function parse is disabled'); },
-  compile: function () { throw new Error('Function compile is disabled'); }
-}, { override: true });
 
 const logger = pino({ level: "silent" });
 
@@ -46,12 +36,12 @@ const CONFIG = {
   MAX_HISTORY: Number(process.env.MAX_HISTORY || 10),
   TEMP_DIR: process.env.TEMP_DIR || "./temp",
   MAX_IMAGE_SIZE: Number(process.env.MAX_IMAGE_SIZE || 10 * 1024 * 1024),
-  MAX_VIDEO_SIZE: Number(process.env.MAX_VIDEO_SIZE || 50 * 1024 * 1024),
   MAX_DOCUMENT_SIZE: Number(process.env.MAX_DOCUMENT_SIZE || 20 * 1024 * 1024),
   SIGHTENGINE_API_USER: process.env.SIGHTENGINE_API_USER || "",
   SIGHTENGINE_API_SECRET: process.env.SIGHTENGINE_API_SECRET || "",
   AI_RATE_LIMIT: Number(process.env.AI_RATE_LIMIT || 10),
   MEDIA_RATE_LIMIT: Number(process.env.MEDIA_RATE_LIMIT || 3),
+  YTDL_API_URL: process.env.YTDL_API_URL || "",
 };
 
 /* =========================================================
@@ -101,7 +91,6 @@ let reconnectAttempts = 0;
 // Message processing
 const processedMessages = new Map();
 const userQueues = new Map();
-const pendingLinks = new Map();
 
 // Rate limiting
 const aiRateLimit = new Map();
@@ -137,34 +126,19 @@ function cleanupTempFile(filePath) {
   }
 }
 
-function extractURL(text) {
-  const urlRegex = /(https?:\/\/[^\s]+)/g;
-  const matches = text.match(urlRegex);
-  return matches ? matches[0] : null;
-}
-
 function isYouTubeUrl(url) {
-  return url.includes("youtube.com") || url.includes("youtu.be");
-}
-
-function isInstagramUrl(url) {
-  return url.includes("instagram.com");
-}
-
-function isTikTokUrl(url) {
-  return url.includes("tiktok.com");
-}
-
-function isFacebookUrl(url) {
-  return url.includes("facebook.com") || url.includes("fb.watch");
-}
-
-function isTwitterUrl(url) {
-  return url.includes("twitter.com") || url.includes("x.com");
-}
-
-function isSupportedPlatform(url) {
-  return isYouTubeUrl(url) || isInstagramUrl(url) || isTikTokUrl(url) || isFacebookUrl(url) || isTwitterUrl(url);
+  try {
+    const u = new URL(url);
+    return (
+      u.hostname === "youtube.com" ||
+      u.hostname === "www.youtube.com" ||
+      u.hostname === "m.youtube.com" ||
+      u.hostname === "youtu.be" ||
+      u.hostname === "www.youtube-nocookie.com"
+    );
+  } catch {
+    return false;
+  }
 }
 
 function checkRateLimit(map, jid, limit) {
@@ -182,15 +156,6 @@ function checkRateLimit(map, jid, limit) {
   
   userLimit.count++;
   return true;
-}
-
-function isSafeUrl(url) {
-  try {
-    const parsed = new URL(url);
-    return parsed.protocol === "http:" || parsed.protocol === "https:";
-  } catch {
-    return false;
-  }
 }
 
 function cleanOldProcessedMessages() {
@@ -420,113 +385,6 @@ async function analyzeImageWithSightengine(imageBuffer, mimetype) {
 }
 
 /* =========================================================
-   MEDIA DOWNLOAD
-========================================================= */
-
-async function downloadVideoFromURL(url) {
-  try {
-    const apis = [
-      `https://api.vevioz.com/api/button/${encodeURIComponent(url)}`,
-      `https://api.davidcyriltech.my.id/download/${encodeURIComponent(url)}`
-    ];
-
-    for (const apiUrl of apis) {
-      try {
-        const response = await axios.get(apiUrl, {
-          timeout: 30000,
-          maxRedirects: 5
-        });
-
-        let videoUrl = null;
-        
-        if (response.data?.video) videoUrl = response.data.video;
-        else if (response.data?.result?.download?.url) videoUrl = response.data.result.download.url;
-        else if (response.data?.url) videoUrl = response.data.url;
-
-        if (videoUrl && isSafeUrl(videoUrl)) {
-          const videoResponse = await axios({
-            method: "get",
-            url: videoUrl,
-            responseType: "arraybuffer",
-            timeout: 120000,
-            maxContentLength: CONFIG.MAX_VIDEO_SIZE
-          });
-          
-          const buffer = Buffer.from(videoResponse.data);
-          
-          if (buffer.length > CONFIG.MAX_VIDEO_SIZE) {
-            throw new Error("Video too large");
-          }
-          
-          const tempFilePath = generateTempFileName(".mp4");
-          fs.writeFileSync(tempFilePath, buffer);
-          
-          return { buffer, tempFilePath, mimetype: "video/mp4" };
-        }
-      } catch (error) {
-        continue;
-      }
-    }
-    
-    return null;
-  } catch (error) {
-    console.error("Video download error:", error.message);
-    return null;
-  }
-}
-
-async function downloadAudioFromURL(url) {
-  try {
-    const apis = [
-      `https://api.vevioz.com/api/button/${encodeURIComponent(url)}`,
-      `https://api.davidcyriltech.my.id/download/${encodeURIComponent(url)}`
-    ];
-
-    for (const apiUrl of apis) {
-      try {
-        const response = await axios.get(apiUrl, {
-          timeout: 30000,
-          maxRedirects: 5
-        });
-
-        let audioUrl = null;
-        
-        if (response.data?.audio) audioUrl = response.data.audio;
-        else if (response.data?.result?.download?.url) audioUrl = response.data.result.download.url;
-
-        if (audioUrl && isSafeUrl(audioUrl)) {
-          const audioResponse = await axios({
-            method: "get",
-            url: audioUrl,
-            responseType: "arraybuffer",
-            timeout: 120000,
-            maxContentLength: CONFIG.MAX_VIDEO_SIZE
-          });
-          
-          const buffer = Buffer.from(audioResponse.data);
-          
-          if (buffer.length > CONFIG.MAX_VIDEO_SIZE) {
-            throw new Error("Audio too large");
-          }
-          
-          const tempFilePath = generateTempFileName(".mp3");
-          fs.writeFileSync(tempFilePath, buffer);
-          
-          return { buffer, tempFilePath, mimetype: "audio/mpeg" };
-        }
-      } catch (error) {
-        continue;
-      }
-    }
-    
-    return null;
-  } catch (error) {
-    console.error("Audio download error:", error.message);
-    return null;
-  }
-}
-
-/* =========================================================
    SUPABASE FUNCTIONS
 ========================================================= */
 
@@ -714,6 +572,7 @@ button:hover{opacity:0.9;}
 .badge.online{background:#c6f6d5;color:#276749;}
 .badge.offline{background:#fed7d7;color:#9b2c2c;}
 .info{background:#f7fafc;padding:15px;border-radius:10px;margin:10px 0;border-left:4px solid #667eea;}
+.command{background:#f7fafc;padding:10px;border-radius:8px;margin:5px 0;font-family:monospace;font-size:14px;}
 </style>
 </head>
 <body>
@@ -744,13 +603,15 @@ button:hover{opacity:0.9;}
 </div>
 
 <div class="card">
-<h2>💡 Bot Features</h2>
+<h2>💡 Bot Commands</h2>
 <div class="info">
-<p>✅ <strong>AI Chat</strong> - Talk to ${CONFIG.AI_NAME}</p>
-<p>✅ <strong>Image Analysis</strong> - Send any image</p>
-<p>✅ <strong>Document Reading</strong> - Send PDF/TXT/DOCX</p>
-<p>✅ <strong>Video Download</strong> - Send YouTube/Instagram link</p>
-<p>✅ <strong>Audio Download</strong> - Reply "audio" to link</p>
+<p><strong>📹 YouTube Video:</strong></p>
+<div class="command">.ytmp4 https://youtu.be/VIDEO_ID</div>
+<p><strong>🎵 YouTube Audio:</strong></p>
+<div class="command">.ytmp3 https://youtu.be/VIDEO_ID</div>
+<p><strong>📸 Image Analysis:</strong> Send any image</p>
+<p><strong>📄 Document Reading:</strong> Send PDF/TXT/DOCX</p>
+<p><strong>💬 AI Chat:</strong> Just send a message</p>
 </div>
 </div>
 </main>
@@ -774,7 +635,6 @@ async function refresh() {
   }
 }
 
-// Auto refresh every 5 seconds
 refresh();
 setInterval(refresh, 5000);
 </script>
@@ -874,7 +734,6 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     
-    // HEALTH
     if (url.pathname === "/health") {
       return sendJSON(res, 200, {
         ok: true,
@@ -883,7 +742,6 @@ const server = http.createServer(async (req, res) => {
       });
     }
     
-    // HOME
     if (url.pathname === "/") {
       return sendJSON(res, 200, {
         ok: true,
@@ -894,7 +752,6 @@ const server = http.createServer(async (req, res) => {
       });
     }
     
-    // DASHBOARD
     if (url.pathname === "/dashboard") {
       res.writeHead(200, {
         "Content-Type": "text/html; charset=utf-8",
@@ -903,7 +760,6 @@ const server = http.createServer(async (req, res) => {
       return res.end(dashboardHTML());
     }
     
-    // PAIR PAGE
     if (url.pathname === "/pair") {
       res.writeHead(200, {
         "Content-Type": "text/html; charset=utf-8",
@@ -912,7 +768,6 @@ const server = http.createServer(async (req, res) => {
       return res.end(pairHTML());
     }
     
-    // QR CODE
     if (url.pathname === "/qr.png") {
       if (!latestQR) {
         res.writeHead(404);
@@ -933,7 +788,6 @@ const server = http.createServer(async (req, res) => {
       }
     }
     
-    // 404
     res.writeHead(404);
     res.end("Not found");
     
@@ -1058,8 +912,6 @@ async function startBot() {
 async function processMessage(msg, jid) {
   let imageData = null;
   let documentData = null;
-  let videoData = null;
-  let audioData = null;
   
   try {
     const hasImage = !!msg.message?.imageMessage;
@@ -1078,14 +930,104 @@ async function processMessage(msg, jid) {
     console.log(`📩 ${jid}: ${text || "[Media]"}`);
     await logMessage(jid, "incoming", text || "[Media]");
     
-    if (/^(help|\/help)$/i.test(text)) {
-      const reply = `🤖 ${CONFIG.AI_NAME}\n\nCommands:\nHELP - Show this menu\nCLEAR - Clear AI memory\n\n📸 Send image for analysis\n📄 Send PDF/TXT for reading\n📹 Send YouTube/Instagram link for download`;
+    // YouTube MP3 Download
+    if (text.startsWith(".ytmp3 ")) {
+      const url = text.slice(7).trim();
+      
+      if (!isYouTubeUrl(url)) {
+        await sock.sendMessage(jid, { 
+          text: "❌ Send a valid YouTube URL.\n\nExample:\n.ytmp3 https://youtu.be/VIDEO_ID" 
+        });
+        return;
+      }
+      
+      if (!CONFIG.YTDL_API_URL) {
+        await sock.sendMessage(jid, { text: "❌ YouTube downloader is not configured." });
+        return;
+      }
+      
+      if (!checkRateLimit(mediaRateLimit, jid, CONFIG.MEDIA_RATE_LIMIT)) {
+        await sock.sendMessage(jid, { text: "⚠️ Download limit reached. Wait a minute." });
+        return;
+      }
+      
+      await sock.sendMessage(jid, { text: "⏳ Downloading audio..." });
+      
+      try {
+        const apiUrl = `${CONFIG.YTDL_API_URL}/ytmp3?url=${encodeURIComponent(url)}`;
+        
+        await sock.sendMessage(jid, {
+          audio: { url: apiUrl },
+          mimetype: "audio/mpeg",
+          fileName: "youtube-audio.mp3"
+        });
+        
+        await logMessage(jid, "outgoing", "YouTube audio sent");
+      } catch (err) {
+        console.error("YTMP3 error:", err);
+        await sock.sendMessage(jid, { text: "❌ Failed to download the audio." });
+      }
+      return;
+    }
+    
+    // YouTube MP4 Download
+    if (text.startsWith(".ytmp4 ")) {
+      const url = text.slice(7).trim();
+      
+      if (!isYouTubeUrl(url)) {
+        await sock.sendMessage(jid, { 
+          text: "❌ Send a valid YouTube URL.\n\nExample:\n.ytmp4 https://youtu.be/VIDEO_ID" 
+        });
+        return;
+      }
+      
+      if (!CONFIG.YTDL_API_URL) {
+        await sock.sendMessage(jid, { text: "❌ YouTube downloader is not configured." });
+        return;
+      }
+      
+      if (!checkRateLimit(mediaRateLimit, jid, CONFIG.MEDIA_RATE_LIMIT)) {
+        await sock.sendMessage(jid, { text: "⚠️ Download limit reached. Wait a minute." });
+        return;
+      }
+      
+      await sock.sendMessage(jid, { text: "⏳ Downloading video..." });
+      
+      try {
+        const apiUrl = `${CONFIG.YTDL_API_URL}/ytmp4?url=${encodeURIComponent(url)}`;
+        
+        await sock.sendMessage(jid, {
+          video: { url: apiUrl },
+          mimetype: "video/mp4",
+          fileName: "youtube-video.mp4",
+          caption: "🎬 YouTube video"
+        });
+        
+        await logMessage(jid, "outgoing", "YouTube video sent");
+      } catch (err) {
+        console.error("YTMP4 error:", err);
+        await sock.sendMessage(jid, { text: "❌ Failed to download the video." });
+      }
+      return;
+    }
+    
+    // Help command
+    if (/^(help|\/help|\.help)$/i.test(text)) {
+      const reply = `🤖 ${CONFIG.AI_NAME} - Commands\n\n` +
+        `📹 **YouTube Video:**\n.ytmp4 [YouTube URL]\n\n` +
+        `🎵 **YouTube Audio:**\n.ytmp3 [YouTube URL]\n\n` +
+        `📸 **Image Analysis:** Send any image\n` +
+        `📄 **Document Reading:** Send PDF/TXT/DOCX\n` +
+        `💬 **AI Chat:** Just send a message\n\n` +
+        `🧹 **Clear Memory:** Send "clear"`;
+      
       await sock.sendMessage(jid, { text: reply });
       await logMessage(jid, "outgoing", reply);
       return;
     }
     
-    if (/^(clear|\/clear)$/i.test(text)) {
+    // Clear history
+    if (/^(clear|\/clear|\.clear)$/i.test(text)) {
       await clearHistory(jid);
       const reply = "🧹 Your AI memory has been cleared.";
       await sock.sendMessage(jid, { text: reply });
@@ -1093,64 +1035,7 @@ async function processMessage(msg, jid) {
       return;
     }
     
-    if (pendingLinks.has(jid)) {
-      const pending = pendingLinks.get(jid);
-      
-      if (/^(1|video|v)$/i.test(text)) {
-        pendingLinks.delete(jid);
-        
-        if (!checkRateLimit(mediaRateLimit, jid, CONFIG.MEDIA_RATE_LIMIT)) {
-          await sock.sendMessage(jid, { text: "⚠️ Media download limit reached. Wait a minute." });
-          return;
-        }
-        
-        await sock.sendMessage(jid, { text: "📹 Downloading video..." });
-        videoData = await downloadVideoFromURL(pending.url);
-        
-        if (videoData) {
-          await sock.sendMessage(jid, {
-            video: videoData.buffer,
-            mimetype: "video/mp4",
-            fileName: "video.mp4"
-          });
-          await logMessage(jid, "outgoing", "Video downloaded");
-        } else {
-          await sock.sendMessage(jid, { text: "⚠️ Failed to download video." });
-        }
-        return;
-      }
-      
-      if (/^(2|audio|mp3|a)$/i.test(text)) {
-        pendingLinks.delete(jid);
-        
-        if (!checkRateLimit(mediaRateLimit, jid, CONFIG.MEDIA_RATE_LIMIT)) {
-          await sock.sendMessage(jid, { text: "⚠️ Media download limit reached. Wait a minute." });
-          return;
-        }
-        
-        await sock.sendMessage(jid, { text: "🎵 Downloading audio..." });
-        audioData = await downloadAudioFromURL(pending.url);
-        
-        if (audioData) {
-          await sock.sendMessage(jid, {
-            audio: audioData.buffer,
-            mimetype: "audio/mpeg",
-            fileName: "audio.mp3"
-          });
-          await logMessage(jid, "outgoing", "Audio downloaded");
-        } else {
-          await sock.sendMessage(jid, { text: "⚠️ Failed to download audio." });
-        }
-        return;
-      }
-      
-      if (/^(cancel|no)$/i.test(text)) {
-        pendingLinks.delete(jid);
-        await sock.sendMessage(jid, { text: "❌ Cancelled." });
-        return;
-      }
-    }
-    
+    // Image processing
     if (hasImage) {
       if (!checkRateLimit(mediaRateLimit, jid, CONFIG.MEDIA_RATE_LIMIT)) {
         await sock.sendMessage(jid, { text: "⚠️ Media limit reached. Wait a minute." });
@@ -1186,6 +1071,7 @@ async function processMessage(msg, jid) {
       return;
     }
     
+    // Document processing
     if (hasDocument) {
       if (!checkRateLimit(mediaRateLimit, jid, CONFIG.MEDIA_RATE_LIMIT)) {
         await sock.sendMessage(jid, { text: "⚠️ Media limit reached. Wait a minute." });
@@ -1221,16 +1107,7 @@ async function processMessage(msg, jid) {
       return;
     }
     
-    const url = extractURL(text);
-    if (url && isSupportedPlatform(url) && isSafeUrl(url)) {
-      pendingLinks.set(jid, { url, timestamp: Date.now() });
-      
-      const reply = `🔗 **Link Detected!**\n\n1️⃣ Video (Max Quality)\n2️⃣ Audio (MP3)\n\nReply "1" for video or "2" for audio`;
-      await sock.sendMessage(jid, { text: reply });
-      await logMessage(jid, "outgoing", "Link detected");
-      return;
-    }
-    
+    // AI response
     if (!checkRateLimit(aiRateLimit, jid, CONFIG.AI_RATE_LIMIT)) {
       await sock.sendMessage(jid, { text: "⚠️ AI limit reached. Wait a minute." });
       return;
@@ -1246,8 +1123,6 @@ async function processMessage(msg, jid) {
   } finally {
     if (imageData?.tempFilePath) cleanupTempFile(imageData.tempFilePath);
     if (documentData?.tempFilePath) cleanupTempFile(documentData.tempFilePath);
-    if (videoData?.tempFilePath) cleanupTempFile(videoData.tempFilePath);
-    if (audioData?.tempFilePath) cleanupTempFile(audioData.tempFilePath);
   }
 }
 
