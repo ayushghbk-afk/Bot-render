@@ -188,14 +188,13 @@ function cleanOldTempFiles() {
 }
 
 /* =========================================================
-   YOUTUBE DOWNLOADER (Multiple Public APIs with Fallback)
+   YOUTUBE DOWNLOADER
 ========================================================= */
 
-async function getYouTubeDownloadUrl(url, type = "mp4") {
+async function getYouTubeDownloadLink(url, type = "mp4") {
   console.log(`🔍 Fetching YouTube ${type} download URL...`);
   
   const apiEndpoints = [
-    // API 1: Vevioz
     {
       name: "vevioz",
       url: `https://api.vevioz.com/api/button/${encodeURIComponent(url)}`,
@@ -204,7 +203,6 @@ async function getYouTubeDownloadUrl(url, type = "mp4") {
         return data?.video || data?.result?.video;
       }
     },
-    // API 2: David Cyril Tech
     {
       name: "davidcyril",
       url: `https://api.davidcyriltech.my.id/download/${encodeURIComponent(url)}`,
@@ -213,7 +211,6 @@ async function getYouTubeDownloadUrl(url, type = "mp4") {
         return data?.result?.download?.url || data?.result?.video;
       }
     },
-    // API 3: Ryzen Desu
     {
       name: "ryzendesu",
       url: `https://api.ryzendesu.vip/api/downloader/yt${type === "mp3" ? "mp3" : "mp4"}?url=${encodeURIComponent(url)}`,
@@ -239,7 +236,7 @@ async function getYouTubeDownloadUrl(url, type = "mp4") {
       if (typeof response.data === "string") {
         const urlMatch = response.data.match(/https?:\/\/[^\s"']+\.(mp4|mp3|m4a|webm)[^\s"']*/i);
         if (urlMatch) {
-          console.log(`✅ Got download URL from ${api.name} (HTML parse)`);
+          console.log(`✅ Got direct URL from ${api.name}`);
           return urlMatch[0];
         }
         continue;
@@ -248,11 +245,9 @@ async function getYouTubeDownloadUrl(url, type = "mp4") {
       const downloadUrl = api.parse(response.data);
       
       if (downloadUrl) {
-        console.log(`✅ Got download URL from ${api.name}`);
+        console.log(`✅ Got direct URL from ${api.name}`);
         return downloadUrl;
       }
-      
-      console.log(`❌ No URL found in ${api.name} response`);
     } catch (error) {
       console.error(`${api.name} failed:`, error.message);
       continue;
@@ -262,7 +257,7 @@ async function getYouTubeDownloadUrl(url, type = "mp4") {
   return null;
 }
 
-async function downloadYouTubeWithCobalt(url, type = "mp4") {
+async function getYouTubeWithCobalt(url, type = "mp4") {
   try {
     console.log("Trying cobalt API...");
     
@@ -280,31 +275,8 @@ async function downloadYouTubeWithCobalt(url, type = "mp4") {
     });
     
     if (cobaltResponse.data?.url) {
-      const downloadUrl = cobaltResponse.data.url;
-      console.log(`Got cobalt URL: ${downloadUrl}`);
-      
-      const mediaResponse = await axios({
-        method: "get",
-        url: downloadUrl,
-        responseType: "arraybuffer",
-        timeout: 180000,
-        maxContentLength: 50 * 1024 * 1024
-      });
-      
-      const buffer = Buffer.from(mediaResponse.data);
-      
-      if (buffer.length > 1000) {
-        const extension = type === "mp3" ? ".mp3" : ".mp4";
-        const tempFilePath = generateTempFileName(extension);
-        fs.writeFileSync(tempFilePath, buffer);
-        
-        return {
-          buffer,
-          tempFilePath,
-          mimetype: type === "mp3" ? "audio/mpeg" : "video/mp4",
-          fileSize: buffer.length
-        };
-      }
+      console.log(`✅ Got cobalt URL`);
+      return cobaltResponse.data.url;
     }
     
     return null;
@@ -314,23 +286,36 @@ async function downloadYouTubeWithCobalt(url, type = "mp4") {
   }
 }
 
-async function downloadYouTubeMedia(url, type = "mp4") {
+async function getYouTubeLink(url, type = "mp4") {
   try {
-    // Try cobalt first (more reliable)
-    const cobaltResult = await downloadYouTubeWithCobalt(url, type);
-    if (cobaltResult) {
-      return cobaltResult;
+    // Try cobalt first
+    const cobaltUrl = await getYouTubeWithCobalt(url, type);
+    if (cobaltUrl) {
+      return cobaltUrl;
     }
     
-    // Fallback to other APIs
-    const downloadUrl = await getYouTubeDownloadUrl(url, type);
+    // Try other APIs
+    const directUrl = await getYouTubeDownloadLink(url, type);
+    if (directUrl) {
+      return directUrl;
+    }
+    
+    return null;
+  } catch (error) {
+    console.error("Get download link error:", error.message);
+    return null;
+  }
+}
+
+async function downloadYouTubeMedia(url, type = "mp4") {
+  try {
+    const downloadUrl = await getYouTubeLink(url, type);
     
     if (!downloadUrl) {
-      console.error("❌ All APIs failed");
       return null;
     }
     
-    console.log(`📥 Downloading ${type} from: ${downloadUrl}`);
+    console.log(`📥 Downloading from: ${downloadUrl}`);
     
     const response = await axios({
       method: "get",
@@ -339,7 +324,7 @@ async function downloadYouTubeMedia(url, type = "mp4") {
       timeout: 180000,
       maxContentLength: 50 * 1024 * 1024,
       headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
       }
     });
     
@@ -353,19 +338,35 @@ async function downloadYouTubeMedia(url, type = "mp4") {
       throw new Error("File too large");
     }
     
-    const extension = type === "mp3" ? ".mp3" : ".mp4";
-    const tempFilePath = generateTempFileName(extension);
-    fs.writeFileSync(tempFilePath, buffer);
-    
     return {
       buffer,
-      tempFilePath,
       mimetype: type === "mp3" ? "audio/mpeg" : "video/mp4",
       fileSize: buffer.length
     };
   } catch (error) {
     console.error("Download error:", error.message);
     return null;
+  }
+}
+
+function getAlternativeLinks(url, type) {
+  const videoId = url.includes("youtu.be") 
+    ? url.split("/").pop().split("?")[0]
+    : url.split("v=")[1]?.split("&")[0] || url;
+  
+  if (type === "mp3") {
+    return [
+      `https://ytmp3.cc/en13/?url=${encodeURIComponent(url)}`,
+      `https://yt1s.com/en${Math.floor(Math.random() * 100)}?q=${encodeURIComponent(url)}`,
+      `https://y2mate.com/youtube/${videoId}`
+    ];
+  } else {
+    return [
+      `https://yt1s.com/en${Math.floor(Math.random() * 100)}?q=${encodeURIComponent(url)}`,
+      `https://y2mate.com/youtube/${videoId}`,
+      `https://ssyoutube.com/${videoId}`,
+      `https://savefrom.net/?url=${encodeURIComponent(url)}`
+    ];
   }
 }
 
@@ -1093,7 +1094,6 @@ async function startBot() {
 async function processMessage(msg, jid) {
   let imageData = null;
   let documentData = null;
-  let mediaData = null;
   
   try {
     const hasImage = !!msg.message?.imageMessage;
@@ -1128,12 +1128,12 @@ async function processMessage(msg, jid) {
         return;
       }
       
-      await sock.sendMessage(jid, { text: "⏳ Downloading audio... This may take a moment." });
+      await sock.sendMessage(jid, { text: "⏳ Getting audio..." });
       
       try {
-        mediaData = await downloadYouTubeMedia(url, "mp3");
+        const mediaData = await downloadYouTubeMedia(url, "mp3");
         
-        if (mediaData && mediaData.buffer.length > 0) {
+        if (mediaData) {
           await sock.sendMessage(jid, {
             audio: mediaData.buffer,
             mimetype: "audio/mpeg",
@@ -1141,13 +1141,21 @@ async function processMessage(msg, jid) {
           });
           await logMessage(jid, "outgoing", "YouTube audio sent");
         } else {
-          await sock.sendMessage(jid, { 
-            text: "❌ Failed to download audio.\n\nPossible reasons:\n• Video might be age-restricted\n• Video might be too long\n• API might be temporarily down\n\nTry another video or try again later." 
+          const links = getAlternativeLinks(url, "mp3");
+          const linkText = links.map((link, i) => `${i + 1}. ${link}`).join("\n\n");
+          
+          await sock.sendMessage(jid, {
+            text: `🎵 **Audio Download Links**\n\nDirect download failed. Use these links:\n\n${linkText}\n\n⚠️ Open in browser and download.`
           });
         }
       } catch (err) {
         console.error("YTMP3 error:", err);
-        await sock.sendMessage(jid, { text: "❌ Download failed. Please try another video." });
+        const links = getAlternativeLinks(url, "mp3");
+        const linkText = links.map((link, i) => `${i + 1}. ${link}`).join("\n\n");
+        
+        await sock.sendMessage(jid, {
+          text: `❌ Download failed. Use these links:\n\n${linkText}`
+        });
       }
       return;
     }
@@ -1168,12 +1176,12 @@ async function processMessage(msg, jid) {
         return;
       }
       
-      await sock.sendMessage(jid, { text: "⏳ Downloading video... This may take a moment." });
+      await sock.sendMessage(jid, { text: "⏳ Getting video..." });
       
       try {
-        mediaData = await downloadYouTubeMedia(url, "mp4");
+        const mediaData = await downloadYouTubeMedia(url, "mp4");
         
-        if (mediaData && mediaData.buffer.length > 0) {
+        if (mediaData) {
           await sock.sendMessage(jid, {
             video: mediaData.buffer,
             mimetype: "video/mp4",
@@ -1182,13 +1190,21 @@ async function processMessage(msg, jid) {
           });
           await logMessage(jid, "outgoing", "YouTube video sent");
         } else {
-          await sock.sendMessage(jid, { 
-            text: "❌ Failed to download video.\n\nPossible reasons:\n• Video might be age-restricted\n• Video might be too long\n• API might be temporarily down\n\nTry another video or try again later." 
+          const links = getAlternativeLinks(url, "mp4");
+          const linkText = links.map((link, i) => `${i + 1}. ${link}`).join("\n\n");
+          
+          await sock.sendMessage(jid, {
+            text: `📹 **Video Download Links**\n\nDirect download failed. Use these links:\n\n${linkText}\n\n⚠️ Open in browser and download.`
           });
         }
       } catch (err) {
         console.error("YTMP4 error:", err);
-        await sock.sendMessage(jid, { text: "❌ Download failed. Please try another video." });
+        const links = getAlternativeLinks(url, "mp4");
+        const linkText = links.map((link, i) => `${i + 1}. ${link}`).join("\n\n");
+        
+        await sock.sendMessage(jid, {
+          text: `❌ Download failed. Use these links:\n\n${linkText}`
+        });
       }
       return;
     }
@@ -1305,7 +1321,6 @@ async function processMessage(msg, jid) {
   } finally {
     if (imageData?.tempFilePath) cleanupTempFile(imageData.tempFilePath);
     if (documentData?.tempFilePath) cleanupTempFile(documentData.tempFilePath);
-    if (mediaData?.tempFilePath) cleanupTempFile(mediaData.tempFilePath);
   }
 }
 
