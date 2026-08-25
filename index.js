@@ -188,81 +188,145 @@ function cleanOldTempFiles() {
 }
 
 /* =========================================================
-   YOUTUBE DOWNLOADER (Using Public APIs)
+   YOUTUBE DOWNLOADER (Multiple Public APIs with Fallback)
 ========================================================= */
 
 async function getYouTubeDownloadUrl(url, type = "mp4") {
-  try {
-    console.log(`🔍 Fetching YouTube ${type} download URL...`);
-    
-    // Try multiple public APIs
-    const apis = [
-      {
-        name: "api1",
-        url: `https://api.vevioz.com/api/button/${encodeURIComponent(url)}`
-      },
-      {
-        name: "api2",
-        url: `https://api.davidcyriltech.my.id/download/${encodeURIComponent(url)}`
-      },
-      {
-        name: "api3",
-        url: `https://api.ryzendesu.vip/api/downloader/yt${type === "mp3" ? "mp3" : "mp4"}?url=${encodeURIComponent(url)}`
+  console.log(`🔍 Fetching YouTube ${type} download URL...`);
+  
+  const apiEndpoints = [
+    // API 1: Vevioz
+    {
+      name: "vevioz",
+      url: `https://api.vevioz.com/api/button/${encodeURIComponent(url)}`,
+      parse: (data) => {
+        if (type === "mp3") return data?.audio || data?.result?.audio;
+        return data?.video || data?.result?.video;
       }
-    ];
-    
-    for (const api of apis) {
-      try {
-        const response = await axios.get(api.url, {
-          timeout: 30000,
-          maxRedirects: 5,
-          headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-          }
-        });
-        
-        let downloadUrl = null;
-        
-        if (type === "mp3") {
-          // Look for audio URL
-          downloadUrl = 
-            response.data?.audio ||
-            response.data?.result?.download?.url ||
-            response.data?.url ||
-            response.data?.download_url ||
-            response.data?.result?.url;
-        } else {
-          // Look for video URL
-          downloadUrl = 
-            response.data?.video ||
-            response.data?.result?.download?.url ||
-            response.data?.url ||
-            response.data?.download_url ||
-            response.data?.result?.url;
+    },
+    // API 2: David Cyril Tech
+    {
+      name: "davidcyril",
+      url: `https://api.davidcyriltech.my.id/download/${encodeURIComponent(url)}`,
+      parse: (data) => {
+        if (type === "mp3") return data?.result?.download?.url || data?.result?.audio;
+        return data?.result?.download?.url || data?.result?.video;
+      }
+    },
+    // API 3: Ryzen Desu
+    {
+      name: "ryzendesu",
+      url: `https://api.ryzendesu.vip/api/downloader/yt${type === "mp3" ? "mp3" : "mp4"}?url=${encodeURIComponent(url)}`,
+      parse: (data) => {
+        return data?.url || data?.result?.url || data?.download?.url;
+      }
+    }
+  ];
+
+  for (const api of apiEndpoints) {
+    try {
+      console.log(`Trying ${api.name}...`);
+      
+      const response = await axios.get(api.url, {
+        timeout: 20000,
+        maxRedirects: 5,
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "Accept": "application/json, text/plain, */*"
         }
-        
-        if (downloadUrl) {
-          console.log(`✅ Got download URL from ${api.name}`);
-          return downloadUrl;
+      });
+      
+      if (typeof response.data === "string") {
+        const urlMatch = response.data.match(/https?:\/\/[^\s"']+\.(mp4|mp3|m4a|webm)[^\s"']*/i);
+        if (urlMatch) {
+          console.log(`✅ Got download URL from ${api.name} (HTML parse)`);
+          return urlMatch[0];
         }
-      } catch (error) {
-        console.error(`${api.name} failed:`, error.message);
         continue;
+      }
+      
+      const downloadUrl = api.parse(response.data);
+      
+      if (downloadUrl) {
+        console.log(`✅ Got download URL from ${api.name}`);
+        return downloadUrl;
+      }
+      
+      console.log(`❌ No URL found in ${api.name} response`);
+    } catch (error) {
+      console.error(`${api.name} failed:`, error.message);
+      continue;
+    }
+  }
+  
+  return null;
+}
+
+async function downloadYouTubeWithCobalt(url, type = "mp4") {
+  try {
+    console.log("Trying cobalt API...");
+    
+    const cobaltResponse = await axios.post("https://api.cobalt.tools/api/json", {
+      url: url,
+      downloadMode: type === "mp3" ? "audio" : "auto",
+      audioFormat: type === "mp3" ? "mp3" : undefined,
+      videoQuality: type === "mp4" ? "360" : undefined
+    }, {
+      headers: {
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+      },
+      timeout: 30000
+    });
+    
+    if (cobaltResponse.data?.url) {
+      const downloadUrl = cobaltResponse.data.url;
+      console.log(`Got cobalt URL: ${downloadUrl}`);
+      
+      const mediaResponse = await axios({
+        method: "get",
+        url: downloadUrl,
+        responseType: "arraybuffer",
+        timeout: 180000,
+        maxContentLength: 50 * 1024 * 1024
+      });
+      
+      const buffer = Buffer.from(mediaResponse.data);
+      
+      if (buffer.length > 1000) {
+        const extension = type === "mp3" ? ".mp3" : ".mp4";
+        const tempFilePath = generateTempFileName(extension);
+        fs.writeFileSync(tempFilePath, buffer);
+        
+        return {
+          buffer,
+          tempFilePath,
+          mimetype: type === "mp3" ? "audio/mpeg" : "video/mp4",
+          fileSize: buffer.length
+        };
       }
     }
     
     return null;
-  } catch (error) {
-    console.error("YouTube download error:", error);
+  } catch (cobaltError) {
+    console.error("Cobalt API failed:", cobaltError.message);
     return null;
   }
 }
 
 async function downloadYouTubeMedia(url, type = "mp4") {
   try {
+    // Try cobalt first (more reliable)
+    const cobaltResult = await downloadYouTubeWithCobalt(url, type);
+    if (cobaltResult) {
+      return cobaltResult;
+    }
+    
+    // Fallback to other APIs
     const downloadUrl = await getYouTubeDownloadUrl(url, type);
     
     if (!downloadUrl) {
+      console.error("❌ All APIs failed");
       return null;
     }
     
@@ -272,14 +336,18 @@ async function downloadYouTubeMedia(url, type = "mp4") {
       method: "get",
       url: downloadUrl,
       responseType: "arraybuffer",
-      timeout: 120000,
-      maxContentLength: 50 * 1024 * 1024, // 50MB
+      timeout: 180000,
+      maxContentLength: 50 * 1024 * 1024,
       headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
       }
     });
     
     const buffer = Buffer.from(response.data);
+    
+    if (buffer.length === 0) {
+      throw new Error("Empty file");
+    }
     
     if (buffer.length > 50 * 1024 * 1024) {
       throw new Error("File too large");
@@ -1060,12 +1128,12 @@ async function processMessage(msg, jid) {
         return;
       }
       
-      await sock.sendMessage(jid, { text: "⏳ Downloading audio..." });
+      await sock.sendMessage(jid, { text: "⏳ Downloading audio... This may take a moment." });
       
       try {
         mediaData = await downloadYouTubeMedia(url, "mp3");
         
-        if (mediaData) {
+        if (mediaData && mediaData.buffer.length > 0) {
           await sock.sendMessage(jid, {
             audio: mediaData.buffer,
             mimetype: "audio/mpeg",
@@ -1073,11 +1141,13 @@ async function processMessage(msg, jid) {
           });
           await logMessage(jid, "outgoing", "YouTube audio sent");
         } else {
-          await sock.sendMessage(jid, { text: "❌ Failed to download audio. Please try another video." });
+          await sock.sendMessage(jid, { 
+            text: "❌ Failed to download audio.\n\nPossible reasons:\n• Video might be age-restricted\n• Video might be too long\n• API might be temporarily down\n\nTry another video or try again later." 
+          });
         }
       } catch (err) {
         console.error("YTMP3 error:", err);
-        await sock.sendMessage(jid, { text: "❌ Failed to download the audio." });
+        await sock.sendMessage(jid, { text: "❌ Download failed. Please try another video." });
       }
       return;
     }
@@ -1098,12 +1168,12 @@ async function processMessage(msg, jid) {
         return;
       }
       
-      await sock.sendMessage(jid, { text: "⏳ Downloading video..." });
+      await sock.sendMessage(jid, { text: "⏳ Downloading video... This may take a moment." });
       
       try {
         mediaData = await downloadYouTubeMedia(url, "mp4");
         
-        if (mediaData) {
+        if (mediaData && mediaData.buffer.length > 0) {
           await sock.sendMessage(jid, {
             video: mediaData.buffer,
             mimetype: "video/mp4",
@@ -1112,11 +1182,13 @@ async function processMessage(msg, jid) {
           });
           await logMessage(jid, "outgoing", "YouTube video sent");
         } else {
-          await sock.sendMessage(jid, { text: "❌ Failed to download video. Please try another video." });
+          await sock.sendMessage(jid, { 
+            text: "❌ Failed to download video.\n\nPossible reasons:\n• Video might be age-restricted\n• Video might be too long\n• API might be temporarily down\n\nTry another video or try again later." 
+          });
         }
       } catch (err) {
         console.error("YTMP4 error:", err);
-        await sock.sendMessage(jid, { text: "❌ Failed to download the video." });
+        await sock.sendMessage(jid, { text: "❌ Download failed. Please try another video." });
       }
       return;
     }
